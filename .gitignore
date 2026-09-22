@@ -1,0 +1,23 @@
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and credentials
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+team19.auth.json
+playwright/.auth/
+*.dpapi
+*.dpapi.*
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
