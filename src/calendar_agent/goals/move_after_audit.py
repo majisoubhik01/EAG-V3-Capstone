@@ -31,6 +31,11 @@ def _event_ref(event: dict[str, object]) -> CalendarEventRef:
     )
 
 
+def _event_id(event: dict[str, Any]) -> str | None:
+    value = event.get("id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _is_audit_candidate(event: dict[str, Any]) -> bool:
     text = " ".join(str(event.get(key) or "") for key in ("title", "description"))
     return "audit" in text.lower()
@@ -84,8 +89,16 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
         )
 
     parsed_audits = [(event, _parse_event_times(event)) for event in audit_like]
-    malformed_audits = [event for event, parsed in parsed_audits if parsed is None]
-    valid_audits = [(event, parsed) for event, parsed in parsed_audits if parsed is not None]
+    malformed_audits = [
+        event
+        for event, parsed in parsed_audits
+        if parsed is None or _event_id(event) is None
+    ]
+    valid_audits = [
+        (event, parsed)
+        for event, parsed in parsed_audits
+        if parsed is not None and _event_id(event) is not None
+    ]
     if malformed_audits:
         return _clarification(
             task,
@@ -114,11 +127,26 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
         )
 
     events = tools.list_events(limit=1000)
+    audit_id = _event_id(audit_event)
+    assert audit_id is not None
+    matching_audit_ids = sum(1 for event in events if _event_id(event) == audit_id)
+    if matching_audit_ids > 1:
+        return _clarification(
+            task,
+            reference,
+            "The affected-event state is ambiguous because the audit ID is duplicated.",
+            f"Found multiple events with audit ID {audit_id!r}.",
+        )
     moves: list[EventMove] = []
+    move_ids: set[str] = set()
     timezone_ambiguous: list[dict[str, Any]] = []
     malformed_events: list[dict[str, Any]] = []
+    malformed_after_audit: list[dict[str, Any]] = []
+    identity_ambiguous: list[dict[str, Any]] = []
+    duplicate_move_ids: set[str] = set()
     for event in events:
-        if event.get("id") == audit_event.get("id"):
+        event_id = _event_id(event)
+        if event_id == audit_id:
             continue
         parsed = _parse_event_times(event)
         if parsed is None:
@@ -133,6 +161,8 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
                 else:
                     if start_check.tzinfo is None or end_check.tzinfo is None or not event.get("timezone"):
                         timezone_ambiguous.append(event)
+                    elif start_check > audit_end:
+                        malformed_after_audit.append(event)
                     else:
                         malformed_events.append(event)
             else:
@@ -142,11 +172,18 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
         event_start, event_end = parsed
         if event_start <= audit_end:
             continue
+        if event_id is None:
+            identity_ambiguous.append(event)
+            continue
+        if event_id in move_ids:
+            duplicate_move_ids.add(event_id)
+            continue
         proposed_start = event_start + shift
         proposed_end = event_end + shift
+        move_ids.add(event_id)
         moves.append(
             EventMove(
-                event_id=str(event.get("id", "")),
+                event_id=event_id,
                 title=str(event.get("title", "")),
                 original_start_at=str(event["start_at"]),
                 original_end_at=str(event["end_at"]),
@@ -164,6 +201,27 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             reference,
             "The affected-event boundary is ambiguous because event timezone data is missing.",
             f"{len(timezone_ambiguous)} event(s) have datetime values without an explicit timezone.",
+        )
+    if malformed_after_audit:
+        return _clarification(
+            task,
+            reference,
+            "The affected-event state is ambiguous because an event after the audit is malformed.",
+            f"{len(malformed_after_audit)} event(s) that would be moved could not be validated.",
+        )
+    if identity_ambiguous:
+        return _clarification(
+            task,
+            reference,
+            "The affected-event state is ambiguous because a movable event has no valid identity.",
+            f"{len(identity_ambiguous)} event(s) that would be moved have a missing or blank ID.",
+        )
+    if duplicate_move_ids:
+        return _clarification(
+            task,
+            reference,
+            "The affected-event state is ambiguous because movable event IDs are duplicated.",
+            f"Duplicate movable event IDs: {', '.join(sorted(duplicate_move_ids))}.",
         )
     if not moves:
         return _clarification(

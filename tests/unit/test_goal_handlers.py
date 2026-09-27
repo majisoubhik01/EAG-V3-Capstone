@@ -1,8 +1,9 @@
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from calendar_agent.agent import CalendarAgent
 from calendar_agent.models import AgentTask, ResultStatus
-from harness.assertions import verify_supported_slot
+from harness.assertions import verify_result, verify_supported_slot
 
 from .fakes import FakeCalendarTools
 
@@ -104,6 +105,34 @@ def test_unique_plant_head_with_verified_free_slot_is_planned() -> None:
         expected_calendar_id="calendar-1",
     )
     assert slot_verification.passed
+    assert verify_result(result, expected_status=ResultStatus.PLANNED).passed
+    assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_successful_find_planning_does_not_mutate_source_state() -> None:
+    tools = _tools_for_party(free_busy_result=_visible_free_busy([]))
+    before = deepcopy({
+        "parties": tools.parties,
+        "calendars": tools.calendars,
+        "availability_rules": tools.availability_rules,
+        "scheduling_preferences": tools.scheduling_preferences,
+        "free_busy_result": tools.free_busy_result,
+    })
+
+    result = CalendarAgent(tools).run(
+        AgentTask("calendar.find_30_minutes", "Find 30 minutes with the plant head", _valid_context())
+    )
+
+    after = {
+        "parties": tools.parties,
+        "calendars": tools.calendars,
+        "availability_rules": tools.availability_rules,
+        "scheduling_preferences": tools.scheduling_preferences,
+        "free_busy_result": tools.free_busy_result,
+    }
+    assert result.status is ResultStatus.PLANNED
+    assert result.status is not ResultStatus.COMPLETED
+    assert after == before
     assert not any(call.mutating for call in result.tool_calls)
 
 

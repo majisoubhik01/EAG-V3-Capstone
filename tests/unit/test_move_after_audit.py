@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from calendar_agent.agent import CalendarAgent
 from calendar_agent.models import AgentTask, ResultStatus
-from harness.assertions import verify_rescheduling_plan
+from harness.assertions import verify_rescheduling_plan, verify_result
 
 from .fakes import FakeCalendarTools
 
@@ -56,6 +56,7 @@ def test_exactly_one_audit_plans_events_strictly_after_audit_end() -> None:
         shift=SHIFT,
     )
     assert verification.passed
+    assert verify_result(result, expected_status=ResultStatus.PLANNED).passed
     assert result.claimed_outcome["moved"] is False
     assert not any(call.mutating for call in result.tool_calls)
 
@@ -97,6 +98,28 @@ def test_malformed_event_is_ignored_without_crashing() -> None:
     assert [move.event_id for move in result.rescheduling_plan] == ["after"]
 
 
+def test_malformed_audit_candidate_requires_clarification() -> None:
+    malformed_audit = {**AUDIT, "start_at": "not-a-date"}
+
+    result = run([malformed_audit, event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00")])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_malformed_affected_event_that_starts_after_audit_requires_clarification() -> None:
+    malformed = event(
+        "broken",
+        "2026-09-22T11:00:00+00:00",
+        "2026-09-22T10:30:00+00:00",
+    )
+
+    result = run([AUDIT, malformed, event("after", "2026-09-22T12:00:00+00:00", "2026-09-22T13:00:00+00:00")])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
 def test_no_events_after_audit_is_clarification() -> None:
     result = run([
         AUDIT,
@@ -116,6 +139,68 @@ def test_timezone_null_event_is_not_silently_reinterpreted() -> None:
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
     assert not result.rescheduling_plan
     assert "timezone" in result.summary.lower()
+
+
+def test_missing_audit_id_does_not_produce_a_plan() -> None:
+    result = run([
+        {**AUDIT, "id": ""},
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_missing_affected_event_id_does_not_produce_a_plan() -> None:
+    missing_id = event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00")
+    del missing_id["id"]
+
+    result = run([AUDIT, missing_id])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_duplicate_affected_event_ids_do_not_produce_a_plan() -> None:
+    result = run([
+        AUDIT,
+        event("duplicate", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+        event("duplicate", "2026-09-22T13:00:00+00:00", "2026-09-22T14:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_affected_event_sharing_audit_id_does_not_produce_a_plan() -> None:
+    result = run([
+        AUDIT,
+        event("audit-1", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+        event("after", "2026-09-22T13:00:00+00:00", "2026-09-22T14:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+
+
+def test_successful_planning_does_not_mutate_source_events() -> None:
+    from copy import deepcopy
+
+    events = [
+        AUDIT,
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ]
+    tools = FakeCalendarTools(events=events)
+    before = deepcopy(tools.events)
+
+    result = CalendarAgent(tools).run(
+        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": SHIFT})
+    )
+
+    assert result.status is ResultStatus.PLANNED
+    assert result.status is not ResultStatus.COMPLETED
+    assert tools.events == before
+    assert not any(call.mutating for call in result.tool_calls)
 
 
 def test_missing_shift_is_clarification() -> None:

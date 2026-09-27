@@ -1,3 +1,7 @@
+
+## Persisted evaluation boundary
+
+`RawRunJournal` writes a versioned JSON artifact containing the complete `RawRun` evidence and an `EvaluationManifest` before scoring. The journal redacts credential-shaped fields and bearer values, and its loader rejects malformed, incomplete, or incompatible artifacts. `DeterministicScorer` consumes a loaded run plus independently supplied predicate state and returns only `approve`, `revise`, or `unevaluated`; unavailable live predicates always produce `unevaluated`, which is never a pass. Scoring does not invoke the model, `CalendarAgent`, MCP, or mutations, so a stored run can be rescored with a new scorer version without rerunning it.
 # EAG V3 Capstone
 
 ## Seat 19: Scheduling
