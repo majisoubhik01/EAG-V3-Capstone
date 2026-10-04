@@ -106,11 +106,45 @@ class EvaluationManifest:
 
 
 @dataclass(frozen=True)
+class EvaluationEvidence:
+    """Small, explicit evidence record used to bind scoring to one run."""
+
+    expected_status: str
+    run_completed: bool
+    verification_passed: bool
+    outcome_ok: bool
+    integrity_ok: bool
+    tool_trace_consistent: bool
+    candidate_slot_present: bool
+    raw_run_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.expected_status, str) or not self.expected_status.strip():
+            raise ValueError("expected_status must be a non-empty string")
+        for name in (
+            "run_completed",
+            "verification_passed",
+            "outcome_ok",
+            "integrity_ok",
+            "tool_trace_consistent",
+            "candidate_slot_present",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
+        if (
+            not isinstance(self.raw_run_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.raw_run_fingerprint) is None
+        ):
+            raise ValueError("raw_run_fingerprint must be a SHA-256 hex digest")
+
+
+@dataclass(frozen=True)
 class PersistedRun:
-    """A loaded raw run and the manifest persisted alongside it."""
+    """A loaded raw run, manifest, and explicit scoring evidence."""
 
     raw_run: RawRun
     manifest: EvaluationManifest
+    evaluation_evidence: EvaluationEvidence | None = None
 
 
 def _is_secret_key(key: object) -> bool:
@@ -126,7 +160,7 @@ def _sanitize(value: Any, *, key: object | None = None) -> Any:
     if isinstance(value, str):
         return _BEARER_PATTERN.sub(r"\1" + _REDACTED, value)
     if isinstance(value, Mapping):
-        return {str(item_key): _sanitize(item_value, key=item_key) for item_key, item_value in value.items()}
+        return {item_key: _sanitize(item_value, key=item_key) for item_key, item_value in value.items()}
     if isinstance(value, tuple):
         return tuple(_sanitize(item) for item in value)
     if isinstance(value, list):
@@ -547,6 +581,54 @@ def _manifest_from_data(value: Any) -> EvaluationManifest:
     )
 
 
+def _evaluation_evidence_to_data(evidence: EvaluationEvidence | None) -> dict[str, Any] | None:
+    if evidence is None:
+        return None
+    return {
+        "expected_status": evidence.expected_status,
+        "run_completed": evidence.run_completed,
+        "verification_passed": evidence.verification_passed,
+        "outcome_ok": evidence.outcome_ok,
+        "integrity_ok": evidence.integrity_ok,
+        "tool_trace_consistent": evidence.tool_trace_consistent,
+        "candidate_slot_present": evidence.candidate_slot_present,
+        "raw_run_fingerprint": evidence.raw_run_fingerprint,
+    }
+
+
+def _evaluation_evidence_from_data(value: Any) -> EvaluationEvidence | None:
+    if value is None:
+        return None
+    data = _object(value, "evaluation_evidence")
+    boolean_fields = (
+        "run_completed",
+        "verification_passed",
+        "outcome_ok",
+        "integrity_ok",
+        "tool_trace_consistent",
+        "candidate_slot_present",
+    )
+    booleans = {name: _required(data, name) for name in boolean_fields}
+    if any(not isinstance(item, bool) for item in booleans.values()):
+        raise InvalidArtifactValueError("evaluation evidence flags must be boolean")
+    try:
+        return EvaluationEvidence(
+            expected_status=_string(_required(data, "expected_status"), "evaluation_evidence.expected_status"),
+            run_completed=booleans["run_completed"],
+            verification_passed=booleans["verification_passed"],
+            outcome_ok=booleans["outcome_ok"],
+            integrity_ok=booleans["integrity_ok"],
+            tool_trace_consistent=booleans["tool_trace_consistent"],
+            candidate_slot_present=booleans["candidate_slot_present"],
+            raw_run_fingerprint=_string(
+                _required(data, "raw_run_fingerprint"),
+                "evaluation_evidence.raw_run_fingerprint",
+            ),
+        )
+    except ValueError as exc:
+        raise InvalidArtifactValueError("invalid evaluation evidence") from exc
+
+
 def _resolved_manifest(raw_run: RawRun, manifest: EvaluationManifest | None) -> EvaluationManifest:
     resolved_manifest = manifest or EvaluationManifest.for_run(raw_run)
     if resolved_manifest.run_id is None:
@@ -556,13 +638,20 @@ def _resolved_manifest(raw_run: RawRun, manifest: EvaluationManifest | None) -> 
     return resolved_manifest
 
 
-def _document(raw_run: RawRun, manifest: EvaluationManifest | None) -> dict[str, Any]:
+def _document(
+    raw_run: RawRun,
+    manifest: EvaluationManifest | None,
+    evaluation_evidence: EvaluationEvidence | None,
+) -> dict[str, Any]:
+    if evaluation_evidence is not None and not isinstance(evaluation_evidence, EvaluationEvidence):
+        raise ArtifactSerializationError("evaluation_evidence must be an EvaluationEvidence instance")
     resolved_manifest = _resolved_manifest(raw_run, manifest)
     raw_document = {
         "artifact_type": ARTIFACT_TYPE,
         "artifact_version": JOURNAL_VERSION,
         "raw_run": _raw_run_to_data(raw_run),
         "evaluation_manifest": _manifest_to_data(resolved_manifest),
+        "evaluation_evidence": _evaluation_evidence_to_data(evaluation_evidence),
     }
     return _encode(_sanitize(raw_document))
 
@@ -576,18 +665,31 @@ def _load_document(document: Any) -> PersistedRun:
         raise IncompatibleArtifactVersionError(f"Unsupported journal version: {version!r}")
     raw_run = _raw_run_from_data(_required(root, "raw_run"))
     manifest = _manifest_from_data(_required(root, "evaluation_manifest"))
+    evaluation_evidence = _evaluation_evidence_from_data(root.get("evaluation_evidence"))
     if manifest.run_id is not None and manifest.run_id != raw_run.run_id:
         raise InvalidArtifactValueError("manifest.run_id does not match raw_run.run_id")
-    return PersistedRun(raw_run=raw_run, manifest=manifest)
+    return PersistedRun(
+        raw_run=raw_run,
+        manifest=manifest,
+        evaluation_evidence=evaluation_evidence,
+    )
 
 
 class RawRunJournal:
     """Read and write one versioned JSON journal artifact."""
 
     @staticmethod
-    def dumps(raw_run: RawRun, manifest: EvaluationManifest | None = None) -> str:
+    def dumps(
+        raw_run: RawRun,
+        manifest: EvaluationManifest | None = None,
+        evaluation_evidence: EvaluationEvidence | None = None,
+    ) -> str:
         try:
-            return json.dumps(_document(raw_run, manifest), sort_keys=True, ensure_ascii=True)
+            return json.dumps(
+                _document(raw_run, manifest, evaluation_evidence),
+                sort_keys=True,
+                ensure_ascii=True,
+            )
         except (TypeError, ValueError) as exc:
             if isinstance(exc, ArtifactError):
                 raise
@@ -606,13 +708,21 @@ class RawRunJournal:
         destination: str | Path,
         raw_run: RawRun,
         manifest: EvaluationManifest | None = None,
+        evaluation_evidence: EvaluationEvidence | None = None,
     ) -> PersistedRun:
         path = Path(destination)
         try:
-            path.write_text(RawRunJournal.dumps(raw_run, manifest), encoding="utf-8")
+            path.write_text(
+                RawRunJournal.dumps(raw_run, manifest, evaluation_evidence),
+                encoding="utf-8",
+            )
         except OSError as exc:
             raise ArtifactError(f"could not write artifact: {path}") from exc
-        return PersistedRun(raw_run=raw_run, manifest=_resolved_manifest(raw_run, manifest))
+        return PersistedRun(
+            raw_run=raw_run,
+            manifest=_resolved_manifest(raw_run, manifest),
+            evaluation_evidence=evaluation_evidence,
+        )
 
     @staticmethod
     def load(source: str | Path) -> PersistedRun:
@@ -628,8 +738,9 @@ def persist_raw_run(
     destination: str | Path,
     raw_run: RawRun,
     manifest: EvaluationManifest | None = None,
+    evaluation_evidence: EvaluationEvidence | None = None,
 ) -> PersistedRun:
-    return RawRunJournal.write(destination, raw_run, manifest)
+    return RawRunJournal.write(destination, raw_run, manifest, evaluation_evidence)
 
 
 def load_raw_run(source: str | Path) -> PersistedRun:

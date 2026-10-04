@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 
-from .persistence import PersistedRun
+from .models import AgentResult, ResultStatus, VerificationResult
+from .persistence import EvaluationEvidence, PersistedRun, RawRunJournal
 from .runtime import RawRun
 
 
@@ -45,6 +47,81 @@ class EvaluationResult:
         return self.verdict is Verdict.APPROVE
 
 
+def _raw_run_fingerprint(raw_run: RawRun) -> str:
+    serialized = RawRunJournal.dumps(raw_run)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _candidate_slot_present(result: AgentResult | None) -> bool:
+    return bool(
+        result is not None
+        and result.goal == "calendar.find_30_minutes"
+        and len(result.candidate_slots) == 1
+    )
+
+
+def build_evaluation_evidence(
+    raw_run: RawRun,
+    verification: VerificationResult,
+    *,
+    expected_status: ResultStatus,
+) -> EvaluationEvidence:
+    """Convert Harness verification into explicit, JSON-safe persisted evidence."""
+
+    result = raw_run.result
+    return EvaluationEvidence(
+        expected_status=expected_status.value,
+        run_completed=(
+            raw_run.termination_reason.value == "succeeded"
+            and raw_run.error is None
+            and result is not None
+            and result.status is ResultStatus.PLANNED
+        ),
+        verification_passed=verification.passed,
+        outcome_ok=verification.outcome_ok,
+        integrity_ok=verification.integrity_ok,
+        tool_trace_consistent=(result is not None and result.tool_calls == list(raw_run.tool_trace)),
+        candidate_slot_present=_candidate_slot_present(result),
+        raw_run_fingerprint=_raw_run_fingerprint(raw_run),
+    )
+
+
+def _approval_errors(persisted: PersistedRun) -> list[str]:
+    raw_run = persisted.raw_run
+    evidence = persisted.evaluation_evidence
+    if evidence is None:
+        return ["No persisted evaluation evidence is available."]
+
+    errors: list[str] = []
+    if evidence.raw_run_fingerprint != _raw_run_fingerprint(raw_run):
+        errors.append("Persisted evaluation evidence does not match the raw run.")
+    if evidence.expected_status != ResultStatus.PLANNED.value:
+        errors.append("Approval evidence must expect a planned result.")
+    if not evidence.run_completed:
+        errors.append("The run did not complete with PLANNED/SUCCEEDED semantics.")
+    if not evidence.verification_passed or not evidence.outcome_ok:
+        errors.append("Persisted result verification did not pass.")
+    if not evidence.integrity_ok:
+        errors.append("Persisted tool evidence is not mutation-free and successful.")
+    if not evidence.tool_trace_consistent:
+        errors.append("Persisted result and raw tool traces do not agree.")
+    if evidence.candidate_slot_present != _candidate_slot_present(raw_run.result):
+        errors.append("Persisted candidate-slot evidence is inconsistent with the result.")
+
+    result = raw_run.result
+    if raw_run.termination_reason.value != "succeeded" or raw_run.error is not None:
+        errors.append("The raw run does not record a successful termination.")
+    if result is None or result.status is not ResultStatus.PLANNED:
+        errors.append("The raw run does not contain a planned result.")
+    elif result.tool_calls != list(raw_run.tool_trace):
+        errors.append("The result tool calls do not match the raw tool trace.")
+    if any(call.mutating or not call.succeeded for call in raw_run.tool_trace):
+        errors.append("The raw tool trace contains a mutation or failed call.")
+    if result is not None and result.goal == "calendar.find_30_minutes" and not _candidate_slot_present(result):
+        errors.append("The planned find-30-minutes result lacks candidate-slot evidence.")
+    return errors
+
+
 class DeterministicScorer:
     """Score persisted evidence without invoking an agent, model, or tools."""
 
@@ -80,7 +157,15 @@ class DeterministicScorer:
                 run_id=raw_run.run_id,
                 reason="The required evaluation predicate has no result.",
             )
-        if state.predicate_passed:
+        if state.predicate_passed and isinstance(evidence, PersistedRun):
+            approval_errors = _approval_errors(evidence)
+            if approval_errors:
+                return EvaluationResult(
+                    verdict=Verdict.REVISE,
+                    scorer_version=self.version,
+                    run_id=raw_run.run_id,
+                    reason="Persisted evidence failed approval checks: " + " ".join(approval_errors),
+                )
             return EvaluationResult(
                 verdict=Verdict.APPROVE,
                 scorer_version=self.version,

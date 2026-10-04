@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from calendar_agent.agent import CalendarAgent
@@ -37,6 +38,14 @@ class CountingCalendarAgent(CalendarAgent):
     def run(self, task):
         self.calls += 1
         return super().run(task)
+
+
+class FixedRuntime:
+    def __init__(self, raw_run) -> None:
+        self.raw_run = raw_run
+
+    def run(self, user_instruction: str, context: dict):
+        return self.raw_run
 
 
 def goal_one_model() -> CountingModel:
@@ -160,6 +169,80 @@ def test_harness_persisted_scoring_preserves_unevaluated_without_predicate(tmp_p
     assert report.evaluation is not None
     assert report.evaluation.verdict.value == "unevaluated"
     assert not report.evaluation.passed
+
+
+def _runtime_run_with_trace():
+    tools = FakeCalendarTools()
+    return BoundedAgentRuntime(CalendarAgent(tools), goal_one_model()).run("Find time")
+
+
+def test_harness_rejects_incomplete_result_tool_trace() -> None:
+    raw_run = _runtime_run_with_trace()
+    assert raw_run.result is not None
+    incomplete_result = replace(raw_run.result, tool_calls=raw_run.result.tool_calls[:-1])
+
+    report = Harness(FakeCalendarTools()).run(
+        AgentTask("calendar.find_30_minutes", "Find time"),
+        expected_status=ResultStatus.NEEDS_CLARIFICATION,
+        runtime=FixedRuntime(replace(raw_run, result=incomplete_result)),
+    )
+
+    assert not report.verification.passed
+    assert not report.verification.integrity_ok
+
+
+def test_harness_rejects_fabricated_result_tool_trace() -> None:
+    raw_run = _runtime_run_with_trace()
+    assert raw_run.result is not None
+    fabricated_result = replace(
+        raw_run.result,
+        tool_calls=raw_run.result.tool_calls + [ToolCallRecord("CalendarEvent.create", {}, mutating=True)],
+    )
+
+    report = Harness(FakeCalendarTools()).run(
+        AgentTask("calendar.find_30_minutes", "Find time"),
+        expected_status=ResultStatus.NEEDS_CLARIFICATION,
+        runtime=FixedRuntime(replace(raw_run, result=fabricated_result)),
+    )
+
+    assert not report.verification.passed
+    assert not report.verification.integrity_ok
+
+
+def test_harness_rejects_missing_raw_trace() -> None:
+    raw_run = _runtime_run_with_trace()
+    assert raw_run.result is not None
+
+    report = Harness(FakeCalendarTools()).run(
+        AgentTask("calendar.find_30_minutes", "Find time"),
+        expected_status=ResultStatus.NEEDS_CLARIFICATION,
+        runtime=FixedRuntime(replace(raw_run, tool_trace=raw_run.tool_trace[:-1])),
+    )
+
+    assert not report.verification.passed
+    assert not report.verification.integrity_ok
+
+
+def test_harness_rejects_unexpected_raw_trace_despite_claimed_success() -> None:
+    raw_run = _runtime_run_with_trace()
+    assert raw_run.result is not None
+    unexpected_trace = raw_run.tool_trace + (
+        ToolCallRecord("CalendarEvent.create", {}, mutating=True, succeeded=False, error="disabled"),
+    )
+    claimed_result = replace(
+        raw_run.result,
+        summary="Success: all tools ran.",
+        claimed_outcome={"success": True},
+    )
+
+    report = Harness(FakeCalendarTools()).run(
+        AgentTask("calendar.find_30_minutes", "Find time"),
+        expected_status=ResultStatus.NEEDS_CLARIFICATION,
+        runtime=FixedRuntime(replace(raw_run, result=claimed_result, tool_trace=unexpected_trace)),
+    )
+
+    assert not report.verification.passed
+    assert not report.verification.integrity_ok
 
 
 def test_harness_rejects_planned_goal_one_without_valid_candidate_slot() -> None:

@@ -6,7 +6,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from calendar_agent.agent import CalendarAgent
-from calendar_agent.evaluation import DeterministicScorer, EvaluationResult, EvaluationState
+from calendar_agent.evaluation import (
+    DeterministicScorer,
+    EvaluationResult,
+    EvaluationState,
+    build_evaluation_evidence,
+)
 from calendar_agent.models import AgentResult, AgentTask, ResultStatus, VerificationResult
 from calendar_agent.persistence import load_raw_run, persist_raw_run
 from calendar_agent.runtime import AgentPolicy, BoundedAgentRuntime, Model, RawRun
@@ -50,6 +55,15 @@ class Harness:
         raw_run = runtime.run(task.instruction, task.context)
         if raw_run.result is not None:
             verification = verify_result(raw_run.result, expected_status=expected_status)
+            if raw_run.result.tool_calls != list(raw_run.tool_trace):
+                verification = VerificationResult(
+                    passed=False,
+                    outcome_ok=verification.outcome_ok,
+                    integrity_ok=False,
+                    details=verification.details + (
+                        "AgentResult.tool_calls do not match RawRun.tool_trace.",
+                    ),
+                )
         else:
             verification = VerificationResult(
                 passed=False,
@@ -91,7 +105,15 @@ class Harness:
         if report.raw_run is None:
             raise ValueError("runtime execution did not produce a RawRun")
 
-        persist_raw_run(journal_path, report.raw_run)
+        persist_raw_run(
+            journal_path,
+            report.raw_run,
+            evaluation_evidence=build_evaluation_evidence(
+                report.raw_run,
+                report.verification,
+                expected_status=expected_status,
+            ),
+        )
         persisted = load_raw_run(journal_path)
         evaluation = (scorer or DeterministicScorer()).score(
             persisted,

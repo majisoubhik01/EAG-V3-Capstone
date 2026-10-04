@@ -9,6 +9,7 @@ import pytest
 
 from calendar_agent import (
     AgentPolicy,
+    ArtifactSerializationError,
     BoundedAgentRuntime,
     CalendarAgent,
     DeterministicScorer,
@@ -19,11 +20,14 @@ from calendar_agent import (
     MalformedArtifactError,
     MissingArtifactFieldError,
     RawRunJournal,
+    ResultStatus,
     SelectGoal,
     Verdict,
+    build_evaluation_evidence,
     load_raw_run,
     persist_raw_run,
 )
+from harness.assertions import verify_result
 from tests.unit.fakes import FakeCalendarTools
 
 
@@ -55,6 +59,21 @@ def make_raw_run() -> tuple[Any, CountingModel, FakeCalendarTools]:
     return raw_run, model, tools
 
 
+def persist_verified(path, raw_run) -> None:
+    assert raw_run.result is not None
+    expected_status = raw_run.result.status
+    verification = verify_result(raw_run.result, expected_status=expected_status)
+    persist_raw_run(
+        path,
+        raw_run,
+        evaluation_evidence=build_evaluation_evidence(
+            raw_run,
+            verification,
+            expected_status=expected_status,
+        ),
+    )
+
+
 def test_raw_run_round_trip_preserves_evidence_and_manifest(tmp_path) -> None:
     raw_run, _, _ = make_raw_run()
     manifest = EvaluationManifest.for_run(raw_run)
@@ -75,6 +94,36 @@ def test_raw_run_round_trip_preserves_evidence_and_manifest(tmp_path) -> None:
     assert loaded.manifest.environment is None
 
 
+def test_string_key_mappings_round_trip_without_loss(tmp_path) -> None:
+    raw_run, _, _ = make_raw_run()
+    raw_run = replace(
+        raw_run,
+        supplied_context={"nested": {"value": 1}},
+        policy_metadata={"ordinary": {"value": "ok"}},
+    )
+
+    persist_raw_run(tmp_path / "run.json", raw_run)
+    loaded = load_raw_run(tmp_path / "run.json")
+
+    assert loaded.raw_run.supplied_context == raw_run.supplied_context
+    assert loaded.raw_run.policy_metadata == raw_run.policy_metadata
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"nested": {1: "integer key"}},
+        {"nested": {"1": "string key", 1: "integer key"}},
+    ],
+)
+def test_non_string_mapping_keys_are_rejected_at_any_nesting_level(context, tmp_path) -> None:
+    raw_run, _, _ = make_raw_run()
+    raw_run = replace(raw_run, supplied_context=context)
+
+    with pytest.raises(ArtifactSerializationError):
+        persist_raw_run(tmp_path / "run.json", raw_run)
+
+
 def test_run_persist_load_score_does_not_rerun_model_agent_or_tools(tmp_path) -> None:
     raw_run, model, tools = make_raw_run()
     persist_raw_run(tmp_path / "run.json", raw_run)
@@ -91,15 +140,15 @@ def test_run_persist_load_score_does_not_rerun_model_agent_or_tools(tmp_path) ->
 
 def test_scorer_version_change_rescores_same_persisted_run(tmp_path) -> None:
     raw_run, model, tools = make_raw_run()
-    persist_raw_run(tmp_path / "run.json", raw_run)
+    persist_verified(tmp_path / "run.json", raw_run)
     loaded = load_raw_run(tmp_path / "run.json")
     state = EvaluationState(predicate_available=True, predicate_passed=True)
 
     first = DeterministicScorer("scorer-v1").score(loaded, state=state)
     second = DeterministicScorer("scorer-v2").score(loaded, state=state)
 
-    assert first.verdict is Verdict.APPROVE
-    assert second.verdict is Verdict.APPROVE
+    assert first.verdict is Verdict.REVISE
+    assert second.verdict is Verdict.REVISE
     assert first.run_id == second.run_id == raw_run.run_id
     assert first.scorer_version == "scorer-v1"
     assert second.scorer_version == "scorer-v2"
@@ -144,14 +193,14 @@ def test_missing_predicate_is_unevaluated_and_never_passes(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("state", "verdict"),
     [
-        (EvaluationState(predicate_available=True, predicate_passed=True), Verdict.APPROVE),
+        (EvaluationState(predicate_available=True, predicate_passed=True), Verdict.REVISE),
         (EvaluationState(predicate_available=True, predicate_passed=False), Verdict.REVISE),
         (EvaluationState(), Verdict.UNEVALUATED),
     ],
 )
 def test_all_verdicts_are_deterministic(tmp_path, state, verdict) -> None:
     raw_run, _, _ = make_raw_run()
-    persist_raw_run(tmp_path / "run.json", raw_run)
+    persist_verified(tmp_path / "run.json", raw_run)
     loaded = load_raw_run(tmp_path / "run.json")
 
     first = DeterministicScorer("same-version").score(loaded, state=state)

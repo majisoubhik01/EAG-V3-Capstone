@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -15,9 +15,10 @@ from calendar_agent import (
     SelectGoal,
     TerminationReason,
 )
-from calendar_agent.models import AgentTask
+from calendar_agent.models import AgentResult, AgentTask, MutationDisabledError, ToolCallRecord
 from harness.assertions import verify_result
 from harness.runner import Harness
+from calendar_agent.tools import ReadOnlyCalendarTool
 from tests.unit.fakes import FakeCalendarTools
 
 
@@ -34,6 +35,126 @@ class FakeModel:
         if self.error is not None:
             raise self.error
         return self.decision
+
+
+class FixedCalendarAgent:
+    def __init__(self, result: AgentResult) -> None:
+        self.result = result
+        self.tools = FakeCalendarTools()
+
+    def run(self, task: AgentTask) -> AgentResult:
+        return self.result
+
+
+class PermissiveCalendarTools(FakeCalendarTools):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.mutation_calls: list[str] = []
+
+    def create_event(self, **arguments: Any) -> dict[str, Any]:
+        self.mutation_calls.append("CalendarEvent.create")
+        return {"created": True, **arguments}
+
+    def update_event(self, **arguments: Any) -> dict[str, Any]:
+        self.mutation_calls.append("CalendarEvent.update")
+        return {"updated": True, **arguments}
+
+    def delete_event(self, event_id: str) -> dict[str, Any]:
+        self.mutation_calls.append("CalendarEvent.delete")
+        return {"deleted": event_id}
+
+    def confirm_event(self, event_id: str) -> dict[str, Any]:
+        self.mutation_calls.append("CalendarEvent.confirm")
+        return {"confirmed": event_id}
+
+    def mark_event_tentative(self, event_id: str) -> dict[str, Any]:
+        self.mutation_calls.append("CalendarEvent.mark_tentative")
+        return {"tentative": event_id}
+
+    def cancel_event(self, event_id: str) -> dict[str, Any]:
+        self.mutation_calls.append("CalendarEvent.cancel")
+        return {"cancelled": event_id}
+
+
+class MutationCallingAgent(CalendarAgent):
+    def run(self, task: AgentTask) -> AgentResult:
+        self.tools.create_event(title="should be blocked")
+        return AgentResult(task.goal, ResultStatus.PLANNED, "unreachable")
+
+
+def test_read_only_tool_delegates_reads_and_blocks_all_mutations() -> None:
+    tools = PermissiveCalendarTools(events=[{"id": "event-1"}])
+    read_only = ReadOnlyCalendarTool(tools)
+
+    assert read_only.list_events(limit=10) is tools.events
+    assert tools.trace == [ToolCallRecord("CalendarEvent.list", {"limit": 10})]
+
+    with pytest.raises(MutationDisabledError, match="CalendarEvent.create"):
+        read_only.create_event(title="blocked")
+    with pytest.raises(MutationDisabledError, match="CalendarEvent.update"):
+        read_only.update_event(id="event-1")
+    with pytest.raises(MutationDisabledError, match="CalendarEvent.delete"):
+        read_only.delete_event("event-1")
+    with pytest.raises(MutationDisabledError, match="CalendarEvent.confirm"):
+        read_only.confirm_event("event-1")
+    with pytest.raises(MutationDisabledError, match="CalendarEvent.mark_tentative"):
+        read_only.mark_event_tentative("event-1")
+    with pytest.raises(MutationDisabledError, match="CalendarEvent.cancel"):
+        read_only.cancel_event("event-1")
+
+    assert tools.mutation_calls == []
+    assert [call.tool for call in tools.trace] == [
+        "CalendarEvent.list",
+        "CalendarEvent.create",
+        "CalendarEvent.update",
+        "CalendarEvent.delete",
+        "CalendarEvent.confirm",
+        "CalendarEvent.mark_tentative",
+        "CalendarEvent.cancel",
+    ]
+    assert all(not call.succeeded and call.mutating for call in tools.trace[1:])
+
+
+def test_runtime_gives_agent_a_read_only_tool_boundary() -> None:
+    tools = PermissiveCalendarTools()
+    agent = MutationCallingAgent(tools)
+    runtime = BoundedAgentRuntime(
+        agent,
+        FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {})),
+    )
+
+    raw_run = runtime.run("Find time")
+
+    assert raw_run.result is None
+    assert raw_run.termination_reason is TerminationReason.EXECUTION_FAILURE
+    assert raw_run.error == "MutationDisabledError"
+    assert tools.mutation_calls == []
+    assert raw_run.tool_trace == (
+        ToolCallRecord(
+            "CalendarEvent.create",
+            {"title": "should be blocked"},
+            mutating=True,
+            succeeded=False,
+            error="disabled",
+        ),
+    )
+
+
+def test_direct_calendar_agent_still_receives_the_original_tool() -> None:
+    tools = PermissiveCalendarTools()
+
+    agent = CalendarAgent(tools)
+
+    assert agent.tools is tools
+    assert agent.tools.create_event(title="direct") == {"created": True, "title": "direct"}
+    assert tools.mutation_calls == ["CalendarEvent.create"]
+
+
+def test_runtime_rejects_non_read_only_policy() -> None:
+    model = FakeModel()
+
+    with pytest.raises(ValueError, match="read-only"):
+        AgentPolicy(model=model, read_only=False)
 
 
 def goal_one_tools() -> FakeCalendarTools:
@@ -110,6 +231,60 @@ def test_runtime_selects_goal_one_and_builds_agent_task() -> None:
     assert model.requests[0].policy_metadata["read_only"] is True
 
 
+def test_runtime_does_not_allow_model_context_to_override_supplied_context() -> None:
+    supplied_context = {
+        "now": datetime(2026, 9, 22, 8, tzinfo=timezone.utc),
+        "start": datetime(2026, 9, 22, 9, tzinfo=timezone.utc),
+        "end": datetime(2026, 9, 22, 17, tzinfo=timezone.utc),
+    }
+    model = FakeModel(SelectGoal(
+        goal="calendar.find_30_minutes",
+        instruction="Find time",
+        context={
+            "now": datetime(2030, 1, 1, tzinfo=timezone.utc),
+            "start": datetime(2030, 1, 1, 1, tzinfo=timezone.utc),
+            "end": datetime(2030, 1, 1, 2, tzinfo=timezone.utc),
+            "model_note": "untrusted",
+        },
+    ))
+
+    raw_run = BoundedAgentRuntime(
+        CalendarAgent(FakeCalendarTools()),
+        model,
+    ).run("Find time", supplied_context)
+
+    assert raw_run.task is not None
+    assert raw_run.task.context == {
+        **supplied_context,
+        "model_note": "untrusted",
+    }
+
+
+def test_runtime_isolates_supplied_context_from_model_request_mutation() -> None:
+    supplied_context = {
+        "now": datetime(2026, 9, 22, 8, tzinfo=timezone.utc),
+    }
+
+    class MutatingModel(FakeModel):
+        def decide(self, request: Any) -> object:
+            request.context["now"] = datetime(2030, 1, 1, tzinfo=timezone.utc)
+            return super().decide(request)
+
+    model = MutatingModel(SelectGoal(
+        goal="calendar.find_30_minutes",
+        instruction="Find time",
+        context={},
+    ))
+    raw_run = BoundedAgentRuntime(
+        CalendarAgent(FakeCalendarTools()),
+        model,
+    ).run("Find time", supplied_context)
+
+    assert raw_run.supplied_context == supplied_context
+    assert raw_run.task is not None
+    assert raw_run.task.context == supplied_context
+
+
 def test_runtime_selects_goal_two_and_builds_agent_task() -> None:
     model = FakeModel(SelectGoal(
         goal="calendar.move_after_audit",
@@ -127,6 +302,56 @@ def test_runtime_selects_goal_two_and_builds_agent_task() -> None:
     assert raw_run.result is not None
     assert raw_run.result.status is ResultStatus.PLANNED
     assert [move.event_id for move in raw_run.result.rescheduling_plan] == ["work-1"]
+
+
+@pytest.mark.parametrize(
+    ("status", "termination_reason"),
+    [
+        (ResultStatus.PLANNED, TerminationReason.SUCCEEDED),
+        (ResultStatus.NEEDS_CLARIFICATION, TerminationReason.CLARIFICATION),
+        (ResultStatus.FAILED, TerminationReason.EXECUTION_FAILURE),
+        (ResultStatus.COMPLETED, TerminationReason.EXECUTION_FAILURE),
+    ],
+)
+def test_runtime_maps_only_explicit_result_statuses(
+    status: ResultStatus,
+    termination_reason: TerminationReason,
+) -> None:
+    result = AgentResult(
+        goal="calendar.find_30_minutes",
+        status=status,
+        summary="result",
+    )
+    runtime = BoundedAgentRuntime(
+        FixedCalendarAgent(result),
+        FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {})),
+    )
+
+    raw_run = runtime.run("Find time")
+
+    assert raw_run.result is result
+    assert raw_run.termination_reason is termination_reason
+    if status is ResultStatus.COMPLETED:
+        assert raw_run.error is not None
+    else:
+        assert raw_run.error is None
+
+
+def test_runtime_rejects_unexpected_result_status_without_success() -> None:
+    result = AgentResult(
+        goal="calendar.find_30_minutes",
+        status=cast(Any, "future_status"),
+        summary="result",
+    )
+    runtime = BoundedAgentRuntime(
+        FixedCalendarAgent(result),
+        FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {})),
+    )
+
+    raw_run = runtime.run("Find time")
+
+    assert raw_run.termination_reason is TerminationReason.EXECUTION_FAILURE
+    assert raw_run.error == "unsupported result status: 'future_status'"
 
 
 def test_runtime_rejects_unknown_goal_without_running_calendar_agent() -> None:
@@ -163,6 +388,45 @@ def test_runtime_rejects_malformed_typed_decision_safely() -> None:
     assert raw_run.termination_reason is TerminationReason.INVALID_MODEL_DECISION
     assert raw_run.result is None
     assert tools.trace == []
+
+
+def test_runtime_rejects_non_string_context_keys_before_planner() -> None:
+    model = FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {1: "unexpected"}))
+    tools = FakeCalendarTools()
+
+    raw_run = BoundedAgentRuntime(CalendarAgent(tools), model).run("Find time")
+
+    assert raw_run.termination_reason is TerminationReason.INVALID_MODEL_DECISION
+    assert raw_run.error == "Invalid SelectGoal.context: context has a non-string key"
+    assert raw_run.task is None
+    assert tools.trace == []
+
+
+def test_runtime_rejects_unsupported_context_values_before_planner() -> None:
+    model = FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {"callback": lambda: None}))
+    tools = FakeCalendarTools()
+
+    raw_run = BoundedAgentRuntime(CalendarAgent(tools), model).run("Find time")
+
+    assert raw_run.termination_reason is TerminationReason.INVALID_MODEL_DECISION
+    assert raw_run.error == "Invalid SelectGoal.context: context.callback contains unsupported type function"
+    assert raw_run.task is None
+    assert tools.trace == []
+
+
+def test_runtime_accepts_existing_typed_context_values() -> None:
+    model = FakeModel(SelectGoal(
+        "calendar.move_after_audit",
+        "Move everything after the audit",
+        {"shift": timedelta(hours=1)},
+    ))
+    tools = goal_two_tools()
+
+    raw_run = BoundedAgentRuntime(CalendarAgent(tools), model).run("Move everything after the audit")
+
+    assert raw_run.termination_reason is TerminationReason.SUCCEEDED
+    assert raw_run.task is not None
+    assert raw_run.task.context["shift"] == timedelta(hours=1)
 
 
 def test_runtime_clarification_does_not_run_calendar_agent() -> None:

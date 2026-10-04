@@ -17,7 +17,8 @@ test = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["calendar_agent*", "harness*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]

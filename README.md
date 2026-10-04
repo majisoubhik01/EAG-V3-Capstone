@@ -48,6 +48,32 @@ The handlers remain read-only and stop before event execution:
 
 Goal 1 never creates or books the candidate event, and Goal 2 never updates events. `PLANNED` means only that the read-only state supports a candidate slot or rescheduling plan; it is not equivalent to booking or moving events. The official evaluator predicates/scorer and final mutation semantics remain unavailable and unknown.
 
+## Harness demonstration
+
+The Harness is part of this same repository as the Calendar Agent. It is an independent, deterministic verification layer around the real `CalendarAgent` and `BoundedAgentRuntime`; it does not duplicate goal-handler logic.
+
+Run the local demo:
+
+```powershell
+python -m harness
+```
+
+The demo uses deterministic in-memory Calendar tools and a fixed model decision, then runs the Agent through the Harness, verifies the structured result, writes `.harness-artifacts/demo.json`, reloads that RawRun artifact, and evaluates it. The artifact directory is ignored by Git. No provider, live MCP call, credentials, or mutation is required.
+
+Replay and rescore an existing artifact without rerunning the Agent:
+
+```powershell
+python -m harness replay .harness-artifacts/demo.json
+```
+
+Replay loads the persisted artifact and invokes only the deterministic scorer. It does not invoke the model, `CalendarAgent`, Calendar tools, MCP, or mutations. With no externally supplied predicate, the result is `UNEVALUATED`, which is not approval. An explicit predicate can be supplied when independently available:
+
+```powershell
+python -m harness replay .harness-artifacts/demo.json --predicate passed
+```
+
+Current evaluation is deterministic and predicate-state driven. The demo supplies its independent Harness verification as the predicate; replay does not infer evaluation from model decisions, prose, or `claimed_outcome`.
+
 ## Authentication
 
 The client reads credentials from the local environment. Credentials must not be committed to Git.

@@ -55,6 +55,81 @@ class CalendarTool(Protocol):
     def cancel_event(self, event_id: str) -> dict[str, Any]: ...
 
 
+class ReadOnlyCalendarTool:
+    """Delegate reads while preventing mutations from reaching the wrapped tool."""
+
+    def __init__(self, delegate: CalendarTool) -> None:
+        self._delegate = delegate
+
+    @property
+    def trace(self) -> list[ToolCallRecord]:
+        return self._delegate.trace
+
+    def find_parties(self, **filters: Any) -> list[dict[str, Any]]:
+        return self._delegate.find_parties(**filters)
+
+    def list_calendars(self, **filters: Any) -> list[dict[str, Any]]:
+        return self._delegate.list_calendars(**filters)
+
+    def get_calendar(self, calendar_id: str) -> dict[str, Any]:
+        return self._delegate.get_calendar(calendar_id)
+
+    def list_events(self, **filters: Any) -> list[dict[str, Any]]:
+        return self._delegate.list_events(**filters)
+
+    def get_event(self, event_id: str) -> dict[str, Any]:
+        return self._delegate.get_event(event_id)
+
+    def free_busy(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        emails: Sequence[str] | None = None,
+        calendar_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._delegate.free_busy(
+            start=start,
+            end=end,
+            emails=emails,
+            calendar_ids=calendar_ids,
+        )
+
+    def list_availability_rules(self, **filters: Any) -> list[dict[str, Any]]:
+        return self._delegate.list_availability_rules(**filters)
+
+    def list_scheduling_preferences(self, **filters: Any) -> list[dict[str, Any]]:
+        return self._delegate.list_scheduling_preferences(**filters)
+
+    def _mutation_disabled(self, tool: str, arguments: dict[str, Any]) -> None:
+        self.trace.append(ToolCallRecord(tool, arguments, mutating=True, succeeded=False, error="disabled"))
+        raise MutationDisabledError(f"Mutation tool disabled: {tool}")
+
+    def create_event(self, **arguments: Any) -> dict[str, Any]:
+        self._mutation_disabled("CalendarEvent.create", arguments)
+        return {}
+
+    def update_event(self, **arguments: Any) -> dict[str, Any]:
+        self._mutation_disabled("CalendarEvent.update", arguments)
+        return {}
+
+    def delete_event(self, event_id: str) -> dict[str, Any]:
+        self._mutation_disabled("CalendarEvent.delete", {"id": event_id})
+        return {}
+
+    def confirm_event(self, event_id: str) -> dict[str, Any]:
+        self._mutation_disabled("CalendarEvent.confirm", {"id": event_id})
+        return {}
+
+    def mark_event_tentative(self, event_id: str) -> dict[str, Any]:
+        self._mutation_disabled("CalendarEvent.mark_tentative", {"id": event_id})
+        return {}
+
+    def cancel_event(self, event_id: str) -> dict[str, Any]:
+        self._mutation_disabled("CalendarEvent.cancel", {"id": event_id})
+        return {}
+
+
 class AgentSwitchCalendarTools:
     """Translate typed calendar operations into MCP tool calls."""
 

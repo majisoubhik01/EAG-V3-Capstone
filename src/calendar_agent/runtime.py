@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import Enum
+import math
 from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from .agent import CalendarAgent
 from .models import AgentResult, AgentTask, ResultStatus, ToolCallRecord
 from .planner import HANDLERS
+from .tools import ReadOnlyCalendarTool
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,39 @@ class Fail:
 
 
 ModelDecision = SelectGoal | Clarify | Fail
+
+
+def _context_value_error(value: Any, path: str = "$", active: set[int] | None = None) -> str | None:
+    active = set() if active is None else active
+    if value is None or isinstance(value, (str, bool, int, datetime, timedelta)):
+        return None
+    if isinstance(value, float):
+        return None if math.isfinite(value) else f"{path} contains a non-finite number"
+    if isinstance(value, (Mapping, list, tuple)):
+        value_id = id(value)
+        if value_id in active:
+            return f"{path} contains a cycle"
+        active.add(value_id)
+        try:
+            items = value.items() if isinstance(value, Mapping) else enumerate(value)
+            for key, item in items:
+                if isinstance(value, Mapping) and not isinstance(key, str):
+                    return f"{path} has a non-string key"
+                item_error = _context_value_error(item, f"{path}.{key}", active)
+                if item_error is not None:
+                    return item_error
+        except Exception as exc:
+            return f"{path} could not be inspected: {type(exc).__name__}"
+        finally:
+            active.remove(value_id)
+        return None
+    return f"{path} contains unsupported type {type(value).__name__}"
+
+
+def _decision_context_error(context: Any) -> str | None:
+    if not isinstance(context, Mapping):
+        return "context must be a Mapping"
+    return _context_value_error(context, "context")
 
 
 class Model(Protocol):
@@ -134,6 +170,8 @@ class BoundedAgentRuntime:
         self.policy = policy or AgentPolicy(model=model)
         if self.policy.model is not model:
             raise ValueError("policy.model must be the injected model")
+        if self.policy.read_only:
+            self.calendar_agent.tools = ReadOnlyCalendarTool(self.calendar_agent.tools)
 
     def run(self, user_instruction: str, context: Mapping[str, Any] | None = None) -> RawRun:
         supplied_context = dict(context or {})
@@ -161,7 +199,7 @@ class BoundedAgentRuntime:
         request = ModelRequest(
             user_instruction=user_instruction,
             available_goal_ids=self.policy.goal_ids,
-            context=supplied_context,
+            context=dict(supplied_context),
             policy_metadata=self.policy.metadata(),
         )
 
@@ -284,7 +322,7 @@ class BoundedAgentRuntime:
                     retries_used,
                     TerminationReason.UNKNOWN_GOAL,
                 )
-            if not isinstance(decision.instruction, str) or not decision.instruction.strip() or not isinstance(decision.context, Mapping):
+            if not isinstance(decision.instruction, str) or not decision.instruction.strip():
                 return self._raw_run(
                     user_instruction,
                     supplied_context,
@@ -298,10 +336,40 @@ class BoundedAgentRuntime:
                     TerminationReason.INVALID_MODEL_DECISION,
                 )
 
+            try:
+                decision_context = dict(decision.context)
+            except Exception as exc:
+                return self._raw_run(
+                    user_instruction,
+                    supplied_context,
+                    decisions,
+                    task,
+                    result,
+                    tool_trace,
+                    f"SelectGoal.context could not be copied: {type(exc).__name__}",
+                    steps_used,
+                    retries_used,
+                    TerminationReason.INVALID_MODEL_DECISION,
+                )
+            context_error = _decision_context_error(decision_context)
+            if context_error is not None:
+                return self._raw_run(
+                    user_instruction,
+                    supplied_context,
+                    decisions,
+                    task,
+                    result,
+                    tool_trace,
+                    f"Invalid SelectGoal.context: {context_error}",
+                    steps_used,
+                    retries_used,
+                    TerminationReason.INVALID_MODEL_DECISION,
+                )
+
             task = AgentTask(
                 goal=decision.goal,
                 instruction=decision.instruction,
-                context={**supplied_context, **dict(decision.context)},
+                context={**decision_context, **supplied_context},
             )
             trace_start = len(self.calendar_agent.tools.trace)
             try:
@@ -321,13 +389,18 @@ class BoundedAgentRuntime:
                     TerminationReason.EXECUTION_FAILURE,
                 )
             tool_trace = tuple(self.calendar_agent.tools.trace[trace_start:])
-            termination = (
-                TerminationReason.CLARIFICATION
-                if result.status is ResultStatus.NEEDS_CLARIFICATION
-                else TerminationReason.EXECUTION_FAILURE
-                if result.status is ResultStatus.FAILED
-                else TerminationReason.SUCCEEDED
-            )
+            if result.status is ResultStatus.PLANNED:
+                termination = TerminationReason.SUCCEEDED
+                result_error = None
+            elif result.status is ResultStatus.NEEDS_CLARIFICATION:
+                termination = TerminationReason.CLARIFICATION
+                result_error = None
+            elif result.status is ResultStatus.FAILED:
+                termination = TerminationReason.EXECUTION_FAILURE
+                result_error = None
+            else:
+                termination = TerminationReason.EXECUTION_FAILURE
+                result_error = f"unsupported result status: {result.status!r}"
             return self._raw_run(
                 user_instruction,
                 supplied_context,
@@ -335,7 +408,7 @@ class BoundedAgentRuntime:
                 task,
                 result,
                 tool_trace,
-                None,
+                result_error,
                 steps_used,
                 retries_used,
                 termination,

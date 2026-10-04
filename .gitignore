@@ -21,3 +21,4 @@ playwright/.auth/
 build/
 dist/
 *.egg-info/
+.harness-artifacts/

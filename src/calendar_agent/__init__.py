@@ -44,6 +44,7 @@ from .persistence import (
     MANIFEST_VERSION,
     ArtifactError,
     ArtifactSerializationError,
+    EvaluationEvidence,
     EvaluationManifest,
     IncompatibleArtifactVersionError,
     InvalidArtifactValueError,
@@ -59,6 +60,7 @@ from .evaluation import (
     EvaluationResult,
     EvaluationState,
     Verdict,
+    build_evaluation_evidence,
     score_persisted_run,
 )
 __all__ = [
@@ -100,6 +102,7 @@ __all__ = [
     "MANIFEST_VERSION",
     "ArtifactError",
     "ArtifactSerializationError",
+    "EvaluationEvidence",
     "EvaluationManifest",
     "IncompatibleArtifactVersionError",
     "InvalidArtifactValueError",
@@ -113,5 +116,6 @@ __all__ = [
     "EvaluationResult",
     "EvaluationState",
     "Verdict",
+    "build_evaluation_evidence",
     "score_persisted_run",
 ]
