@@ -60,6 +60,12 @@ python -m harness
 
 The demo uses deterministic in-memory Calendar tools and a fixed model decision, then runs the Agent through the Harness, verifies the structured result, writes `.harness-artifacts/demo.json`, reloads that RawRun artifact, and evaluates it. The artifact directory is ignored by Git. No provider, live MCP call, credentials, or mutation is required.
 
+### Phase 1 local scheduling surface
+
+The independent Harness also includes deterministic fixtures for the newer scheduling surface in `harness.phase1`. These model paginated Party identity data, attendee roles and responses, timezone-aware and malformed free/busy intervals, scheduling-link duration mismatches, audit buffers and strict event boundaries, booking/event consistency, subscription freshness, workflow side effects, risk-based tool policy, execution evidence, and provider or authority failures.
+
+These fixtures are local test data only. Planning remains distinct from execution and proposals remain distinct from committed mutations. The Harness does not call the live Suryodaya deployment, Keystone, a provider, or an external communication/mutation endpoint; provider HTTP 401 evidence is kept distinct from agent or tool permission failures. Live LLM integration, mutation execution, and authoritative subscription or evaluator data remain intentionally unsupported.
+
 Replay and rescore an existing artifact without rerunning the Agent:
 
 ```powershell

@@ -41,7 +41,7 @@ def _is_audit_candidate(event: dict[str, Any]) -> bool:
     return "audit" in text.lower()
 
 
-def _parse_event_times(event: dict[str, Any]) -> tuple[datetime, datetime] | None:
+def _parse_event_interval(event: dict[str, Any]) -> tuple[datetime, datetime] | None:
     start_value = event.get("start_at")
     end_value = event.get("end_at")
     if not isinstance(start_value, str) or not isinstance(end_value, str):
@@ -53,9 +53,36 @@ def _parse_event_times(event: dict[str, Any]) -> tuple[datetime, datetime] | Non
         return None
     if start.tzinfo is None or end.tzinfo is None or end <= start:
         return None
+    return start, end
+
+
+def _parse_event_times(event: dict[str, Any]) -> tuple[datetime, datetime] | None:
+    interval = _parse_event_interval(event)
+    if interval is None:
+        return None
     if not isinstance(event.get("timezone"), str) or not event["timezone"].strip():
         return None
-    return start, end
+    return interval
+
+
+def _parse_event_start(event: dict[str, Any]) -> datetime | None:
+    value = event.get("start_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        start = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return start if start.tzinfo is not None else None
+
+
+def _intervals_overlap(
+    first_start: datetime,
+    first_end: datetime,
+    second_start: datetime,
+    second_end: datetime,
+) -> bool:
+    return first_start < second_end and first_end > second_start
 
 
 def _clarification(
@@ -130,12 +157,14 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
     audit_id = _event_id(audit_event)
     assert audit_id is not None
     matching_audit_ids = sum(1 for event in events if _event_id(event) == audit_id)
-    if matching_audit_ids > 1:
+    if matching_audit_ids != 1:
+        occurrence = "missing from" if matching_audit_ids == 0 else "duplicated in"
         return _clarification(
             task,
             reference,
-            "The affected-event state is ambiguous because the audit ID is duplicated.",
-            f"Found multiple events with audit ID {audit_id!r}.",
+            "The affected-event state is ambiguous because the resolved audit is not present exactly once.",
+            f"The selected audit ID {audit_id[:100]!r} was {occurrence} the full event listing "
+            f"({matching_audit_ids} matches; expected exactly one).",
         )
     moves: list[EventMove] = []
     move_ids: set[str] = set()
@@ -150,23 +179,16 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             continue
         parsed = _parse_event_times(event)
         if parsed is None:
-            start_value = event.get("start_at")
-            end_value = event.get("end_at")
-            if isinstance(start_value, str) and isinstance(end_value, str):
-                try:
-                    start_check = datetime.fromisoformat(start_value.replace("Z", "+00:00"))
-                    end_check = datetime.fromisoformat(end_value.replace("Z", "+00:00"))
-                except ValueError:
-                    malformed_events.append(event)
-                else:
-                    if start_check.tzinfo is None or end_check.tzinfo is None or not event.get("timezone"):
-                        timezone_ambiguous.append(event)
-                    elif start_check > audit_end:
-                        malformed_after_audit.append(event)
-                    else:
-                        malformed_events.append(event)
+            interval = _parse_event_interval(event)
+            if interval is not None:
+                if interval[0] > audit_end:
+                    timezone_ambiguous.append(event)
             else:
-                malformed_events.append(event)
+                start = _parse_event_start(event)
+                if start is not None and start > audit_end:
+                    malformed_after_audit.append(event)
+                else:
+                    malformed_events.append(event)
             continue
 
         event_start, event_end = parsed
@@ -195,6 +217,8 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             )
         )
 
+    moves.sort(key=lambda move: datetime.fromisoformat(move.original_start_at.replace("Z", "+00:00")))
+
     if timezone_ambiguous:
         return _clarification(
             task,
@@ -208,6 +232,18 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             reference,
             "The affected-event state is ambiguous because an event after the audit is malformed.",
             f"{len(malformed_after_audit)} event(s) that would be moved could not be validated.",
+        )
+    if malformed_events:
+        sample_ids = [_event_id(event) or "<missing id>" for event in malformed_events[:5]]
+        remaining = len(malformed_events) - len(sample_ids)
+        sample = ", ".join(sample_ids)
+        if remaining:
+            sample += f", and {remaining} more"
+        return _clarification(
+            task,
+            reference,
+            "The affected-event state is ambiguous because event timestamps are unusable.",
+            f"{len(malformed_events)} event(s) could not be classified or checked for destination conflicts; sample IDs: {sample}.",
         )
     if identity_ambiguous:
         return _clarification(
@@ -223,6 +259,31 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
             "The affected-event state is ambiguous because movable event IDs are duplicated.",
             f"Duplicate movable event IDs: {', '.join(sorted(duplicate_move_ids))}.",
         )
+
+    conflicts: set[str] = set()
+    for index, move in enumerate(moves):
+        proposed_start = datetime.fromisoformat(move.proposed_start_at.replace("Z", "+00:00"))
+        proposed_end = datetime.fromisoformat(move.proposed_end_at.replace("Z", "+00:00"))
+        for other_move in moves[index + 1:]:
+            other_start = datetime.fromisoformat(other_move.proposed_start_at.replace("Z", "+00:00"))
+            other_end = datetime.fromisoformat(other_move.proposed_end_at.replace("Z", "+00:00"))
+            if _intervals_overlap(proposed_start, proposed_end, other_start, other_end):
+                conflicts.add(f"{move.event_id} with {other_move.event_id}")
+        for event in events:
+            event_id = _event_id(event)
+            if event_id in move_ids or event_id == audit_id:
+                continue
+            parsed = _parse_event_interval(event)
+            if parsed is not None and _intervals_overlap(proposed_start, proposed_end, *parsed):
+                conflicts.add(f"{move.event_id} with {event_id or 'an unidentified event'}")
+    if conflicts:
+        return _clarification(
+            task,
+            reference,
+            "The rescheduling proposal conflicts with an existing event.",
+            "Conflicting proposed intervals: " + ", ".join(sorted(conflicts)) + ".",
+        )
+
     if not moves:
         return _clarification(
             task,

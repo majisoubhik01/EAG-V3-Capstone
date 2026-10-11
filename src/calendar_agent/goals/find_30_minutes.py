@@ -13,6 +13,13 @@ from ..tools import CalendarTool
 GOAL = "calendar.find_30_minutes"
 
 _ROLE_TITLES = ("plant manager", "plant head")
+_PARTY_PAGE_SIZE = 100
+_MAX_PARTY_PAGES = 100
+_LEGACY_PARTY_LIMIT = 1000
+
+
+class _PartyResolutionError(ValueError):
+    pass
 
 
 def _clarification(task: AgentTask, summary: str, *ambiguities: str) -> AgentResult:
@@ -25,20 +32,140 @@ def _clarification(task: AgentTask, summary: str, *ambiguities: str) -> AgentRes
 
 
 def _resolve_plant_head(tools: CalendarTool) -> list[dict[str, Any]]:
+    """Resolve from complete pages; legacy lists cannot signal hidden truncation.
+
+    The legacy list path preserves its existing behavior below the requested
+    limit, but rejects a saturated response because it may be incomplete.
+    """
+
     candidates: dict[str, dict[str, Any]] = {}
+    resolution_error: str | None = None
     for title in _ROLE_TITLES:
-        for party in tools.find_parties(limit=1000, job_title=title.title()):
+        page_reader = getattr(tools, "find_parties_page", None)
+        if callable(page_reader):
+            page_number = 1
+            paginated_records: list[dict[str, Any]] = []
+            total_count: int | None = None
+            for page_number in range(1, _MAX_PARTY_PAGES + 1):
+                try:
+                    page = page_reader(
+                        page=page_number,
+                        page_size=_PARTY_PAGE_SIZE,
+                        job_title=title.title(),
+                    )
+                    records = getattr(page, "records", None)
+                    reported_page = getattr(page, "page", None)
+                    reported_page_size = getattr(page, "page_size", None)
+                    reported_total = getattr(page, "total_count", None)
+                    has_more = getattr(page, "has_more", None)
+                except Exception as exc:
+                    raise _PartyResolutionError(
+                        f"Party page {page_number} could not be retrieved or parsed ({type(exc).__name__})."
+                    ) from None
+
+                if (
+                    not isinstance(records, (list, tuple))
+                    or type(reported_page) is not int
+                    or reported_page != page_number
+                    or type(reported_page_size) is not int
+                    or reported_page_size != _PARTY_PAGE_SIZE
+                    or type(reported_total) is not int
+                    or reported_total < 0
+                    or type(has_more) is not bool
+                    or len(records) > _PARTY_PAGE_SIZE
+                ):
+                    raise _PartyResolutionError(
+                        f"Party page {page_number} did not match the pagination contract."
+                    )
+                if total_count is None:
+                    total_count = reported_total
+                elif reported_total != total_count:
+                    raise _PartyResolutionError("Party pagination changed its total record count.")
+
+                expected_has_more = page_number * _PARTY_PAGE_SIZE < reported_total
+                if has_more is not expected_has_more:
+                    raise _PartyResolutionError(
+                        f"Party page {page_number} reported inconsistent completion metadata."
+                    )
+                page_records: list[dict[str, Any]] = []
+                for record in records:
+                    if isinstance(record, dict):
+                        party = record
+                    else:
+                        try:
+                            party = {
+                                "id": record.id,
+                                "email": record.email,
+                                "job_title": record.job_title,
+                            }
+                            if hasattr(record, "name"):
+                                party["name"] = record.name
+                        except Exception as exc:
+                            raise _PartyResolutionError(
+                                f"Party page {page_number} contained an unreadable record ({type(exc).__name__})."
+                            ) from None
+                    page_records.append(party)
+                paginated_records.extend(page_records)
+
+                if not has_more:
+                    if len(paginated_records) != reported_total:
+                        raise _PartyResolutionError(
+                            "Party pagination ended before its reported total was retrieved."
+                        )
+                    break
+                if page_number == _MAX_PARTY_PAGES:
+                    raise _PartyResolutionError(
+                        "Party pagination reached its page limit while more records remained."
+                    )
+            parties = paginated_records
+        else:
+            parties = tools.find_parties(
+                limit=_LEGACY_PARTY_LIMIT,
+                job_title=title.title(),
+            )
+            if not isinstance(parties, list):
+                raise _PartyResolutionError("The legacy Party result was not a list.")
+            if len(parties) >= _LEGACY_PARTY_LIMIT:
+                raise _PartyResolutionError(
+                    "The legacy Party result reached its limit and may be incomplete."
+                )
+
+        for party in parties:
+            if not isinstance(party, dict):
+                resolution_error = resolution_error or "Party results contained an unreadable record."
+                continue
+            job_title = party.get("job_title")
+            if not isinstance(job_title, str) or not job_title.strip():
+                resolution_error = resolution_error or "A Party record is missing its job title."
+                continue
+            normalized_title = job_title.strip().lower()
+            if normalized_title not in _ROLE_TITLES:
+                continue
             party_id = party.get("id")
-            job_title = str(party.get("job_title") or "").strip().lower()
             email = party.get("email")
             if (
-                isinstance(party_id, str)
-                and party_id
-                and isinstance(email, str)
-                and email
-                and job_title in _ROLE_TITLES
+                not isinstance(party_id, str)
+                or not party_id.strip()
+                or not isinstance(email, str)
+                or not email.strip()
             ):
+                resolution_error = resolution_error or "A plant-head Party record has incomplete identity fields."
+                continue
+            previous = candidates.get(party_id)
+            if previous is not None:
+                if any(
+                    isinstance(previous.get(field), str)
+                    and isinstance(party.get(field), str)
+                    and previous[field].strip().casefold() != party[field].strip().casefold()
+                    for field in ("email", "job_title", "name")
+                ):
+                    resolution_error = resolution_error or (
+                        f"Party ID {party_id!r} has conflicting identity records."
+                    )
+            else:
                 candidates[party_id] = party
+    if resolution_error is not None:
+        raise _PartyResolutionError(resolution_error)
     return list(candidates.values())
 
 
@@ -122,7 +249,14 @@ def _busy_intervals(subject: dict[str, Any]) -> list[tuple[datetime, datetime]] 
 def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
     """Resolve the participant and return only a state-supported slot."""
 
-    parties = _resolve_plant_head(tools)
+    try:
+        parties = _resolve_plant_head(tools)
+    except _PartyResolutionError as exc:
+        return _clarification(
+            task,
+            "The plant head cannot be deterministically identified from complete Party data.",
+            str(exc),
+        )
 
     if len(parties) != 1:
         return _clarification(
@@ -160,11 +294,47 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
         return _clarification(task, "Scheduling preferences are invalid.", "The default meeting duration is missing or not numeric.")
     if default_duration != 30:
         return _clarification(task, "The configured default meeting duration is not the requested 30 minutes.", f"Observed default duration: {default_duration} minutes.")
+    link_duration = task.context.get("scheduling_link_duration_minutes")
+    if link_duration is not None:
+        try:
+            link_duration_value = float(link_duration)
+        except (TypeError, ValueError):
+            return _clarification(task, "The scheduling-link duration is invalid.", "A numeric scheduling-link duration is required.")
+        if link_duration_value != 30:
+            return _clarification(
+                task,
+                "The selected scheduling link does not satisfy the requested 30-minute duration.",
+                f"The scheduling link requires {link_duration_value:g} minutes; the goal requires 30 minutes.",
+            )
     min_notice = preference.get("min_notice_hours")
+    if isinstance(min_notice, bool):
+        return _clarification(
+            task,
+            "Scheduling preferences are invalid.",
+            "Minimum notice must be a non-negative finite number of hours.",
+        )
     try:
-        min_notice_delta = timedelta(hours=float(min_notice))
-    except (TypeError, ValueError):
-        return _clarification(task, "Scheduling preferences are invalid.", "Minimum notice is missing or not numeric.")
+        min_notice_hours = float(min_notice)
+    except (TypeError, ValueError, OverflowError):
+        return _clarification(
+            task,
+            "Scheduling preferences are invalid.",
+            "Minimum notice must be a non-negative finite number of hours.",
+        )
+    if min_notice_hours < 0:
+        return _clarification(
+            task,
+            "Scheduling preferences are invalid.",
+            "Minimum notice must be a non-negative finite number of hours.",
+        )
+    try:
+        min_notice_delta = timedelta(hours=min_notice_hours)
+    except (ValueError, OverflowError):
+        return _clarification(
+            task,
+            "Scheduling preferences are invalid.",
+            "Minimum notice must be a non-negative finite number of hours.",
+        )
 
     now = task.context.get("now")
     if not isinstance(now, datetime) or now.tzinfo is None:

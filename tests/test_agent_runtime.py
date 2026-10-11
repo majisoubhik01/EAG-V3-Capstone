@@ -77,8 +77,48 @@ class PermissiveCalendarTools(FakeCalendarTools):
 
 
 class MutationCallingAgent(CalendarAgent):
+    def __init__(self, tools: PermissiveCalendarTools, method: str, arguments: dict[str, Any]) -> None:
+        super().__init__(tools)
+        self.method = method
+        self.arguments = arguments
+
     def run(self, task: AgentTask) -> AgentResult:
-        self.tools.create_event(title="should be blocked")
+        getattr(self.tools, self.method)(**self.arguments)
+        return AgentResult(task.goal, ResultStatus.PLANNED, "unreachable")
+
+
+class SwallowingMutationAgent(CalendarAgent):
+    def run(self, task: AgentTask) -> AgentResult:
+        for method, arguments in (
+            ("create_event", {"title": "should be blocked"}),
+            ("create_event", {"title": "should be blocked"}),
+            ("update_event", {"id": "event-1"}),
+            ("delete_event", {"event_id": "event-1"}),
+        ):
+            try:
+                getattr(self.tools, method)(**arguments)
+            except MutationDisabledError:
+                continue
+            raise AssertionError(f"read-only policy allowed {method}")
+        return AgentResult(
+            task.goal,
+            ResultStatus.PLANNED,
+            "The event was created.",
+            claimed_outcome={"created": True},
+        )
+
+
+class ReadFailureCalendarTools(FakeCalendarTools):
+    def find_parties(self, **filters: Any) -> list[dict[str, Any]]:
+        self.trace.append(
+            ToolCallRecord("Party.list", filters, succeeded=False, error="LookupError")
+        )
+        raise LookupError("party directory unavailable")
+
+
+class ReadCallingAgent(CalendarAgent):
+    def run(self, task: AgentTask) -> AgentResult:
+        self.tools.find_parties()
         return AgentResult(task.goal, ResultStatus.PLANNED, "unreachable")
 
 
@@ -115,9 +155,24 @@ def test_read_only_tool_delegates_reads_and_blocks_all_mutations() -> None:
     assert all(not call.succeeded and call.mutating for call in tools.trace[1:])
 
 
-def test_runtime_gives_agent_a_read_only_tool_boundary() -> None:
+@pytest.mark.parametrize(
+    ("method", "arguments", "tool"),
+    [
+        ("create_event", {"title": "should be blocked"}, "CalendarEvent.create"),
+        ("update_event", {"id": "event-1"}, "CalendarEvent.update"),
+        ("delete_event", {"event_id": "event-1"}, "CalendarEvent.delete"),
+        ("confirm_event", {"event_id": "event-1"}, "CalendarEvent.confirm"),
+        ("mark_event_tentative", {"event_id": "event-1"}, "CalendarEvent.mark_tentative"),
+        ("cancel_event", {"event_id": "event-1"}, "CalendarEvent.cancel"),
+    ],
+)
+def test_runtime_gives_agent_a_read_only_tool_boundary(
+    method: str,
+    arguments: dict[str, Any],
+    tool: str,
+) -> None:
     tools = PermissiveCalendarTools()
-    agent = MutationCallingAgent(tools)
+    agent = MutationCallingAgent(tools, method, arguments)
     runtime = BoundedAgentRuntime(
         agent,
         FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {})),
@@ -131,13 +186,78 @@ def test_runtime_gives_agent_a_read_only_tool_boundary() -> None:
     assert tools.mutation_calls == []
     assert raw_run.tool_trace == (
         ToolCallRecord(
+            tool,
+            arguments if method not in {"delete_event", "confirm_event", "mark_event_tentative", "cancel_event"} else {"id": "event-1"},
+            mutating=True,
+            succeeded=False,
+            error="disabled",
+        ),
+    )
+
+
+def test_runtime_fails_closed_when_handler_swallows_multiple_mutation_denials() -> None:
+    tools = PermissiveCalendarTools()
+    runtime = BoundedAgentRuntime(
+        SwallowingMutationAgent(tools),
+        FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {})),
+    )
+
+    raw_run = runtime.run("Find time")
+
+    assert tools.mutation_calls == []
+    assert raw_run.termination_reason is TerminationReason.EXECUTION_FAILURE
+    assert raw_run.error == "read-only policy denied mutation: CalendarEvent.create"
+    assert raw_run.result is not None
+    assert raw_run.result.status is ResultStatus.FAILED
+    assert raw_run.result.claimed_outcome == {}
+    assert raw_run.result.tool_calls == list(raw_run.tool_trace)
+    assert raw_run.tool_trace == (
+        ToolCallRecord(
             "CalendarEvent.create",
             {"title": "should be blocked"},
             mutating=True,
             succeeded=False,
             error="disabled",
         ),
+        ToolCallRecord(
+            "CalendarEvent.create",
+            {"title": "should be blocked"},
+            mutating=True,
+            succeeded=False,
+            error="disabled",
+        ),
+        ToolCallRecord(
+            "CalendarEvent.update",
+            {"id": "event-1"},
+            mutating=True,
+            succeeded=False,
+            error="disabled",
+        ),
+        ToolCallRecord(
+            "CalendarEvent.delete",
+            {"id": "event-1"},
+            mutating=True,
+            succeeded=False,
+            error="disabled",
+        ),
     )
+
+
+def test_runtime_distinguishes_tool_failure_from_policy_denial() -> None:
+    tools = ReadFailureCalendarTools()
+    runtime = BoundedAgentRuntime(
+        ReadCallingAgent(tools),
+        FakeModel(SelectGoal("calendar.find_30_minutes", "Find time", {})),
+    )
+
+    raw_run = runtime.run("Find time")
+
+    assert raw_run.termination_reason is TerminationReason.EXECUTION_FAILURE
+    assert raw_run.error == "LookupError"
+    assert raw_run.tool_trace == (
+        ToolCallRecord("Party.list", {}, succeeded=False, error="LookupError"),
+    )
+    assert not raw_run.tool_trace[0].mutating
 
 
 def test_direct_calendar_agent_still_receives_the_original_tool() -> None:

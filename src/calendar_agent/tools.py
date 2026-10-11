@@ -65,6 +65,11 @@ class ReadOnlyCalendarTool:
     def trace(self) -> list[ToolCallRecord]:
         return self._delegate.trace
 
+    def __getattr__(self, name: str) -> Any:
+        if name != "find_parties_page":
+            raise AttributeError(name)
+        return getattr(self._delegate, name)
+
     def find_parties(self, **filters: Any) -> list[dict[str, Any]]:
         return self._delegate.find_parties(**filters)
 

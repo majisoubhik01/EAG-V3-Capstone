@@ -1,0 +1,7 @@
+install = "pip install -e ."
+run = "python -m harness.runner"
+results = "results.json"
+
+# Seat 19's AgentSwitch instance is not verified yet. Fill this before submission.
+instances = []
+timeout_minutes = 10

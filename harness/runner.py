@@ -4,21 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import sys
+from typing import TYPE_CHECKING
 
-from calendar_agent.agent import CalendarAgent
-from calendar_agent.evaluation import (
-    DeterministicScorer,
-    EvaluationResult,
-    EvaluationState,
-    build_evaluation_evidence,
-)
-from calendar_agent.models import AgentResult, AgentTask, ResultStatus, VerificationResult
-from calendar_agent.persistence import load_raw_run, persist_raw_run
-from calendar_agent.runtime import AgentPolicy, BoundedAgentRuntime, Model, RawRun
-from calendar_agent.tools import CalendarTool
+_SRC_ROOT = Path(__file__).resolve().parent.parent / "src"
+if _SRC_ROOT.is_dir() and str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
 
-from .assertions import verify_result
-
+if TYPE_CHECKING:
+    from calendar_agent.evaluation import EvaluationResult, EvaluationState
+    from calendar_agent.models import AgentResult, AgentTask, ResultStatus, VerificationResult
+    from calendar_agent.runtime import AgentPolicy, BoundedAgentRuntime, Model, RawRun
+    from calendar_agent.tools import CalendarTool
 
 @dataclass(frozen=True)
 class HarnessReport:
@@ -42,6 +39,11 @@ class Harness:
         model: Model | None = None,
         policy: AgentPolicy | None = None,
     ) -> HarnessReport:
+        from calendar_agent.agent import CalendarAgent
+        from calendar_agent.models import ResultStatus, VerificationResult
+        from calendar_agent.runtime import BoundedAgentRuntime
+        from .assertions import verify_result
+
         if runtime is not None and (model is not None or policy is not None):
             raise ValueError("runtime cannot be combined with model or policy")
         if runtime is None and model is not None:
@@ -92,6 +94,12 @@ class Harness:
     ) -> HarnessReport:
         """Run through the runtime, persist evidence, reload it, and score it."""
 
+        from calendar_agent.evaluation import (
+            DeterministicScorer,
+            build_evaluation_evidence,
+        )
+        from calendar_agent.persistence import load_raw_run, persist_raw_run
+
         if runtime is None and model is None:
             raise ValueError("run_persisted requires a runtime or model")
 
@@ -120,3 +128,15 @@ class Harness:
             state=predicate_state,
         )
         return replace(report, evaluation=evaluation)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Delegate explicit module execution to the offline server shell."""
+
+    from .server_runner import main as server_main
+
+    return server_main(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

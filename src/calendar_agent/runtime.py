@@ -389,6 +389,25 @@ class BoundedAgentRuntime:
                     TerminationReason.EXECUTION_FAILURE,
                 )
             tool_trace = tuple(self.calendar_agent.tools.trace[trace_start:])
+            denied_mutation = next((call for call in tool_trace if call.mutating), None)
+            if denied_mutation is not None:
+                result.status = ResultStatus.FAILED
+                result.summary = "A Calendar mutation was denied by the read-only runtime policy."
+                result.ambiguities.append("The runtime blocked a Calendar mutation attempt.")
+                result.claimed_outcome.clear()
+                result.tool_calls = list(tool_trace)
+                return self._raw_run(
+                    user_instruction,
+                    supplied_context,
+                    decisions,
+                    task,
+                    result,
+                    tool_trace,
+                    f"read-only policy denied mutation: {denied_mutation.tool}",
+                    steps_used,
+                    retries_used,
+                    TerminationReason.EXECUTION_FAILURE,
+                )
             if result.status is ResultStatus.PLANNED:
                 termination = TerminationReason.SUCCEEDED
                 result_error = None

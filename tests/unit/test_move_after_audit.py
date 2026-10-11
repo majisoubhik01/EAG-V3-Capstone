@@ -33,10 +33,28 @@ def event(event_id: str, start: str, end: str, *, title: str = "Work") -> dict[s
     }
 
 
+class SplitAuditListingTools(FakeCalendarTools):
+    def __init__(self, full_listing: list[dict[str, object]]) -> None:
+        super().__init__()
+        self.full_listing = full_listing
+
+    def list_events(self, **filters: object) -> list[dict[str, object]]:
+        self._record("CalendarEvent.list", filters)
+        if filters.get("search") == "audit":
+            return [AUDIT]
+        return self.full_listing
+
+
 def run(events: list[dict[str, object]], *, shift: timedelta | None = SHIFT):
     context = {"shift": shift} if shift is not None else {}
     return CalendarAgent(FakeCalendarTools(events=events)).run(
         AgentTask("calendar.move_after_audit", "Move everything after the audit", context)
+    )
+
+
+def run_with_split_listings(full_listing: list[dict[str, object]]):
+    return CalendarAgent(SplitAuditListingTools(full_listing)).run(
+        AgentTask("calendar.move_after_audit", "Move everything after the audit", {"shift": SHIFT})
     )
 
 
@@ -59,6 +77,40 @@ def test_exactly_one_audit_plans_events_strictly_after_audit_end() -> None:
     assert verify_result(result, expected_status=ResultStatus.PLANNED).passed
     assert result.claimed_outcome["moved"] is False
     assert not any(call.mutating for call in result.tool_calls)
+
+
+def test_audit_missing_from_full_listing_requires_clarification() -> None:
+    result = run_with_split_listings([
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "audit-1" in " ".join(result.ambiguities)
+    assert "0 matches" in " ".join(result.ambiguities)
+
+
+def test_audit_duplicated_in_full_listing_requires_clarification() -> None:
+    result = run_with_split_listings([
+        AUDIT,
+        {**AUDIT, "title": "Duplicate audit copy"},
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "audit-1" in " ".join(result.ambiguities)
+    assert "2 matches" in " ".join(result.ambiguities)
+
+
+def test_exactly_one_audit_in_full_listing_continues_valid_planning() -> None:
+    result = run_with_split_listings([
+        AUDIT,
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.PLANNED
+    assert [move.event_id for move in result.rescheduling_plan] == ["after"]
 
 
 def test_multiple_audits_do_not_produce_a_plan() -> None:
@@ -87,10 +139,37 @@ def test_event_overlapping_audit_is_not_selected() -> None:
     assert [move.event_id for move in result.rescheduling_plan] == ["after"]
 
 
-def test_malformed_event_is_ignored_without_crashing() -> None:
+def test_malformed_event_with_unknown_position_requires_clarification() -> None:
     result = run([
         AUDIT,
         {"id": "malformed", "title": "Broken", "start_at": "not-a-date", "end_at": "also-broken", "timezone": "UTC"},
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert "malformed" in " ".join(result.ambiguities)
+
+
+def test_malformed_end_before_audit_cannot_hide_a_destination_conflict() -> None:
+    result = run([
+        AUDIT,
+        event("uncertain", "2026-09-22T08:00:00+00:00", "not-a-date"),
+        event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
+    ])
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.rescheduling_plan
+    assert any("uncertain" in ambiguity for ambiguity in result.ambiguities)
+
+
+def test_unrelated_pre_audit_interval_without_timezone_is_not_blanket_rejected() -> None:
+    without_timezone = event("before", "2026-09-22T07:00:00+00:00", "2026-09-22T08:00:00+00:00")
+    del without_timezone["timezone"]
+
+    result = run([
+        AUDIT,
+        without_timezone,
         event("after", "2026-09-22T11:00:00+00:00", "2026-09-22T12:00:00+00:00"),
     ])
 
