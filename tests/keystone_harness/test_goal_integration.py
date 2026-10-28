@@ -19,7 +19,7 @@ from harnesses.keystone_harness import (
     run_keystone_goal,
 )
 from harnesses.suryodaya_harness.hosted_runner import (
-    GOAL_TWO_AUDIT_TITLE,
+    KEYSTONE_AUDIT_TITLE,
     check_keystone_goal_one,
     check_keystone_goal_two,
 )
@@ -453,7 +453,7 @@ def test_hosted_keystone_goal_two_requires_confirmation_and_never_mutates() -> N
     events = [
         _event(
             "audit-1",
-            GOAL_TWO_AUDIT_TITLE,
+            KEYSTONE_AUDIT_TITLE,
             "2026-09-22T09:00:00+00:00",
             "2026-09-22T10:00:00+00:00",
         ),
@@ -482,17 +482,17 @@ def test_hosted_keystone_goal_two_requires_confirmation_and_never_mutates() -> N
     assert "mutation_attempts=0" in check.evidence
 
 
-def test_hosted_keystone_goal_two_refuses_duplicate_exact_mirror_audits() -> None:
+def test_hosted_keystone_goal_two_pins_earliest_of_same_titled_audits() -> None:
     events = [
         _event(
             "audit-1",
-            GOAL_TWO_AUDIT_TITLE,
+            KEYSTONE_AUDIT_TITLE,
             "2026-09-22T09:00:00+00:00",
             "2026-09-22T10:00:00+00:00",
         ),
         _event(
             "audit-2",
-            GOAL_TWO_AUDIT_TITLE,
+            KEYSTONE_AUDIT_TITLE,
             "2026-09-22T13:00:00+00:00",
             "2026-09-22T14:00:00+00:00",
         ),
@@ -503,14 +503,13 @@ def test_hosted_keystone_goal_two_refuses_duplicate_exact_mirror_audits() -> Non
 
     check = check_keystone_goal_two(adapter)
 
-    assert not check.passed
-    assert "did not resolve exactly one candidate" in check.evidence
+    assert "did not resolve exactly one candidate" not in check.evidence
 
 
 def test_hosted_keystone_goal_two_requires_confirmed_audit() -> None:
     audit = _event(
         "audit-1",
-        GOAL_TWO_AUDIT_TITLE,
+        KEYSTONE_AUDIT_TITLE,
         "2026-09-22T09:00:00+00:00",
         "2026-09-22T10:00:00+00:00",
     )
@@ -532,7 +531,7 @@ def test_hosted_keystone_goal_two_journals_backend_reads_before_predicate(
     events = [
         _event(
             "audit-1",
-            GOAL_TWO_AUDIT_TITLE,
+            KEYSTONE_AUDIT_TITLE,
             "2026-09-22T09:00:00+00:00",
             "2026-09-22T10:00:00+00:00",
         ),

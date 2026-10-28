@@ -55,6 +55,12 @@ def _event_ref(
     )
 
 
+def _is_background_event(event: dict[str, Any]) -> bool:
+    """All-day and subscription-feed events (e.g. holidays) are not reschedulable meetings."""
+
+    return event.get("all_day") is True or bool(event.get("subscription_id"))
+
+
 def _event_id(event: dict[str, Any]) -> str | None:
     value = event.get("id")
     return value.strip() if isinstance(value, str) and value.strip() else None
@@ -533,6 +539,14 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
                 )
             )
         ]
+        selected_event_id = task.context.get("audit_event_id")
+        if isinstance(selected_event_id, str) and selected_event_id.strip():
+            # A caller that already chose one of several same-titled audits pins it by ID.
+            audit_like = [
+                event
+                for event in audit_like
+                if _event_id(event) == selected_event_id.strip()
+            ]
         if (
             fallback_timezone is None
             and use_calendar_timezone
@@ -690,7 +704,7 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
     identity_ambiguous: list[dict[str, Any]] = []
     for event in events:
         event_id = _event_id(event)
-        if event_id == audit_record_id:
+        if event_id == audit_record_id or _is_background_event(event):
             continue
         parsed = _parse_event_times(event, fallback_timezone)
         if parsed is None:
@@ -836,10 +850,35 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
                 if _intervals_overlap(
                     proposed_start, proposed_end, other_start, other_end
                 ):
+                    # A uniform shift preserves overlaps between moved events,
+                    # so only pairs that did not already overlap are new conflicts.
+                    original_start = datetime.fromisoformat(
+                        move.original_start_at.replace("Z", "+00:00")
+                    )
+                    original_end = datetime.fromisoformat(
+                        move.original_end_at.replace("Z", "+00:00")
+                    )
+                    other_original_start = datetime.fromisoformat(
+                        other_move.original_start_at.replace("Z", "+00:00")
+                    )
+                    other_original_end = datetime.fromisoformat(
+                        other_move.original_end_at.replace("Z", "+00:00")
+                    )
+                    if _intervals_overlap(
+                        original_start,
+                        original_end,
+                        other_original_start,
+                        other_original_end,
+                    ):
+                        continue
                     found.add(f"{move.event_id} with {other_move.event_id}")
             for event in events:
                 event_id = _event_id(event)
-                if event_id in candidate_move_ids or event_id == audit_record_id:
+                if (
+                    event_id in candidate_move_ids
+                    or event_id == audit_record_id
+                    or _is_background_event(event)
+                ):
                     continue
                 parsed = _parse_event_interval(event, fallback_timezone)
                 if parsed is not None and _intervals_overlap(
