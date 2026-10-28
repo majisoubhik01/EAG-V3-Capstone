@@ -15,6 +15,7 @@ from .client import (
     KeystoneProtocolError,
 )
 from .authorization import (
+    GOAL_ONE_LIST_READ_OPERATIONS,
     RESOURCE_READ_OPERATIONS,
     validate_json_schema_instance,
 )
@@ -335,6 +336,19 @@ def map_event_attendee_record(
     )
 
 
+def map_goal_one_record(
+    record: Mapping[str, Any],
+) -> KeystoneMappedRecord[dict[str, Any]]:
+    source_id = record.get("id")
+    if not isinstance(source_id, str) or not source_id.strip():
+        return KeystoneMappedRecord(
+            source_id=None,
+            value=None,
+            errors=("record has no valid string ID",),
+        )
+    return KeystoneMappedRecord(source_id=source_id, value=dict(record))
+
+
 class KeystoneCalendarAdapter:
     """Allowlisted resource adapter with opt-in disposable event mutations."""
 
@@ -416,6 +430,63 @@ class KeystoneCalendarAdapter:
             "EventAttendee.list", filters, limit, map_event_attendee_record
         )
 
+    def list_scheduling_preferences(
+        self,
+        *,
+        filters: Mapping[str, Any] | None = None,
+        limit: int = 20,
+    ) -> KeystoneResourceListResult[dict[str, Any]]:
+        return self._list_resource(
+            "SchedulingPreferences.list", filters, limit, map_goal_one_record
+        )
+
+    def list_availability_rules(
+        self,
+        *,
+        filters: Mapping[str, Any] | None = None,
+        limit: int = 20,
+    ) -> KeystoneResourceListResult[dict[str, Any]]:
+        return self._list_resource(
+            "AvailabilityRule.list", filters, limit, map_goal_one_record
+        )
+
+    def read_goal_one_endpoint(
+        self,
+        operation: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[KeystoneListRequest, dict[str, Any]]:
+        if operation != "endpoint.calendar.free_busy":
+            raise KeystoneOperationNotAllowedError(
+                "Keystone endpoint is not in the Goal 1 read allowlist."
+            )
+        request = KeystoneListRequest(operation, dict(arguments))
+        authorization = self._client.authorize_read_request(operation, request.arguments)
+        descriptor = self._client.validate_read_authorization(authorization)
+        if self._synthetic_response_pages is None:
+            response = self._client.call_authorized_read(authorization)
+        else:
+            response = self._synthetic_response_pages.get((operation, 0))
+            if response is None:
+                raise KeystoneProtocolError(
+                    f"{operation} synthetic response data is missing."
+                )
+            if isinstance(response, KeystoneClientError):
+                raise response
+        if not isinstance(response, Mapping):
+            raise KeystoneProtocolError(
+                f"{operation} structured response is not an object."
+            )
+        validate_json_schema_instance(
+            descriptor.output_schema,
+            response,
+            location=(
+                "hosted Goal 1 endpoint response"
+                if self._synthetic_response_pages is None
+                else "synthetic Goal 1 endpoint response"
+            ),
+        )
+        return request, dict(response)
+
     def _list_resource(
         self,
         tool_name: str,
@@ -423,7 +494,7 @@ class KeystoneCalendarAdapter:
         limit: int,
         mapper: Callable[[Mapping[str, Any]], KeystoneMappedRecord[_T]],
     ) -> KeystoneResourceListResult[_T]:
-        if tool_name not in RESOURCE_READ_OPERATIONS:
+        if tool_name not in RESOURCE_READ_OPERATIONS | GOAL_ONE_LIST_READ_OPERATIONS:
             raise KeystoneOperationNotAllowedError(
                 "Keystone Calendar adapter operation is not allowlisted."
             )

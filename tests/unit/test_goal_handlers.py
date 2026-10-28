@@ -478,6 +478,7 @@ def test_not_shared_free_busy_is_not_confirmed_free() -> None:
 
     assert result.status is ResultStatus.NEEDS_CLARIFICATION
     assert not result.candidate_slots
+    assert "not shared enough" in result.summary
     assert "not confirmed" in " ".join(result.ambiguities)
     assert not any(call.mutating for call in result.tool_calls)
 

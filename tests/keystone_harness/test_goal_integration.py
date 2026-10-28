@@ -11,13 +11,13 @@ import harnesses.suryodaya_harness.hosted_runner as hosted_runner
 from harnesses.keystone_harness import (
     DiscoveredTool,
     KeystoneCalendarAdapter,
-    KeystoneCapabilityUnavailableError,
     KeystoneClient,
     KeystoneClientError,
     KeystoneConfig,
     KeystoneTransportError,
     run_keystone_goal,
 )
+from harnesses.keystone_harness.goal_integration import KeystoneSchemaValidationError
 from harnesses.suryodaya_harness.hosted_runner import (
     KEYSTONE_AUDIT_TITLE,
     check_keystone_goal_one,
@@ -38,9 +38,15 @@ _RESOURCE_FILTERS: dict[str, dict[str, dict[str, Any]]] = {
         "calendar_id": {"type": "string"},
     },
     "EventAttendee.list": {"event_id": {"type": "string"}},
+    "SchedulingPreferences.list": {"company_id": {"type": "string"}},
+    "AvailabilityRule.list": {
+        "owner_party_id": {"type": "string"},
+        "calendar_id": {"type": "string"},
+        "company_id": {"type": "string"},
+    },
 }
 
-_TOOL_NAMES = tuple(_RESOURCE_FILTERS)
+_TOOL_NAMES = (*_RESOURCE_FILTERS, "endpoint.calendar.free_busy")
 _BASE_TIME = datetime(2026, 9, 22, 8, tzinfo=timezone.utc)
 _FIND_CONTEXT = {
     "now": _BASE_TIME,
@@ -102,6 +108,54 @@ class _DiscoveryOnlySession:
 
 
 def _tool(name: str, *, output_schema: dict[str, Any] | None = None) -> DiscoveredTool:
+    if name == "endpoint.calendar.free_busy":
+        return DiscoveredTool(
+            name=name,
+            read_only_hint=True,
+            description="Read free/busy for calendars or people",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "minLength": 1},
+                    "end": {"type": "string", "minLength": 1},
+                    "emails": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ]
+                    },
+                    "calendar_ids": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ]
+                    },
+                    "as_level": {
+                        "type": "string",
+                        "enum": ["free_busy", "read", "write"],
+                    },
+                },
+                "required": ["start", "end"],
+                "additionalProperties": False,
+            },
+            annotations={"readOnlyHint": True, "destructiveHint": False},
+            output_schema=output_schema or {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "result": {"type": "object"},
+                },
+                "required": ["status", "result"],
+                "additionalProperties": True,
+            },
+            meta={
+                "agentswitch": {
+                    "permission": "read",
+                    "discovery": "caller",
+                    "risk": "READ",
+                }
+            },
+        )
     properties: dict[str, Any] = {
         "limit": {
             "type": "integer",
@@ -292,24 +346,92 @@ def _first_page_with_1000_events() -> list[dict[str, str]]:
     ]
 
 
-def test_find_goal_resolves_unique_plant_manager_then_reports_missing_capabilities() -> None:
+def test_find_goal_uses_verified_keystone_scheduling_reads() -> None:
+    free_busy = {
+        "status": "ok",
+        "result": {
+            "ok": True,
+            "window": {
+                "start": _FIND_CONTEXT["start"].isoformat(),
+                "end": _FIND_CONTEXT["end"].isoformat(),
+            },
+            "subjects": [
+                {
+                    "subject": "party-1@example.test",
+                    "subject_kind": "email",
+                    "visibility": "visible",
+                    "visibility_code": "",
+                    "busy": [],
+                    "calendars": [
+                        {
+                            "calendar_id": "calendar-1",
+                            "access_level": "free_busy",
+                            "actual_access_level": "free_busy",
+                            "access_source": "grant",
+                        }
+                    ],
+                },
+                {
+                    "subject": "calendar-1",
+                    "subject_kind": "calendar",
+                    "visibility": "visible",
+                    "visibility_code": "",
+                    "busy": [],
+                    "calendars": [
+                        {
+                            "calendar_id": "calendar-1",
+                            "access_level": "free_busy",
+                            "actual_access_level": "free_busy",
+                            "access_source": "grant",
+                        }
+                    ],
+                },
+            ],
+        },
+    }
     adapter, session = _adapter({
         ("Party.list", 0): _page([_party("party-1")], total=1),
         ("Calendar.list", 0): _page([_calendar()], total=1),
+        ("SchedulingPreferences.list", 0): _page(
+            [{"id": "preferences-1", "default_meeting_duration": 30, "min_notice_hours": 0}],
+            total=1,
+        ),
+        ("AvailabilityRule.list", 0): _page(
+            [{
+                "id": "rule-1",
+                "owner_party_id": "party-1",
+                "timezone": "UTC",
+                "weekly_hours": [
+                    {"day": "tuesday", "start": "09:00", "end": "17:00", "enabled": True}
+                ],
+                "date_overrides": [],
+            }],
+            total=1,
+        ),
+        ("endpoint.calendar.free_busy", 0): free_busy,
     })
 
     result = _run_find(adapter)
 
-    assert result.status is ResultStatus.NEEDS_CLARIFICATION
-    assert not result.candidate_slots
-    assert len(result.tool_calls) == 4
+    assert result.status is ResultStatus.PLANNED
+    assert len(result.candidate_slots) == 1
     assert sum(call.tool == "Party.list" for call in result.tool_calls) == 2
     assert any(call.tool == "Calendar.list" for call in result.tool_calls)
-    assert any("SchedulingPreferences.list" in item for item in result.ambiguities)
-    assert any("AvailabilityRule.list" in item for item in result.ambiguities)
-    assert any("endpoint.calendar.free_busy" in item for item in result.ambiguities)
+    assert any(call.tool == "SchedulingPreferences.list" for call in result.tool_calls)
+    assert any(call.tool == "AvailabilityRule.list" for call in result.tool_calls)
+    assert any(call.tool == "endpoint.calendar.free_busy" for call in result.tool_calls)
     assert session.methods == ["tools/list"]
     assert not any(call.mutating for call in result.tool_calls)
+
+    check_now = _FIND_CONTEXT["start"]
+    free_busy["result"]["window"] = {
+        "start": check_now.isoformat(),
+        "end": (check_now + timedelta(days=14)).isoformat(),
+    }
+    check = check_keystone_goal_one(adapter, now=check_now)
+    assert check.passed, check.evidence
+    assert "independently re-verified" in check.evidence
+    assert "mutation_attempts=0" in check.evidence
 
 
 def test_find_goal_no_plant_manager_requires_clarification() -> None:
@@ -371,6 +493,25 @@ def test_find_goal_incomplete_calendar_pagination_is_not_an_empty_list() -> None
     assert not result.candidate_slots
     assert any("incomplete_data" in item for item in result.ambiguities)
     assert "Calendar.list" in " ".join(result.ambiguities)
+
+
+def test_find_goal_reports_missing_plant_head_owned_calendar_explicitly() -> None:
+    adapter, _ = _adapter({
+        ("Party.list", 0): _page([_party("party-1")], total=1),
+        ("Calendar.list", 0): _page([], total=0),
+    })
+
+    result = _run_find(adapter)
+
+    assert result.status is ResultStatus.NEEDS_CLARIFICATION
+    assert not result.candidate_slots
+    assert "No deterministically owned calendar was found for the plant head" in result.summary
+    assert [call.tool for call in result.tool_calls] == [
+        "Party.list",
+        "Party.list",
+        "Calendar.list",
+    ]
+    assert not any(call.mutating for call in result.tool_calls)
 
 
 @pytest.mark.parametrize(
@@ -435,7 +576,7 @@ def test_move_goal_plans_complete_synthetic_events_without_mutation() -> None:
     assert session.methods == ["tools/list"]
 
 
-def test_hosted_keystone_goal_one_stays_unevaluated_without_required_capabilities() -> None:
+def test_hosted_keystone_goal_one_stays_unevaluated_when_reads_are_incomplete() -> None:
     adapter, _ = _adapter({
         ("Party.list", 0): _page([_party("party-1")], total=1),
         ("Calendar.list", 0): _page([_calendar()], total=1),
@@ -445,7 +586,8 @@ def test_hosted_keystone_goal_one_stays_unevaluated_without_required_capabilitie
 
     assert not check.passed
     assert check.evidence.startswith("UNEVALUATED:")
-    assert "availability rules" in check.evidence
+    assert "candidate availability requires complete verified" in check.evidence
+    assert "reason_code=planner_needs_clarification" in check.evidence
     assert "mutation_attempts=0" in check.evidence
 
 
@@ -991,11 +1133,11 @@ def test_attendee_mapping_preserves_record_and_event_identity() -> None:
     assert session.methods == ["tools/list"]
 
 
-def test_free_busy_and_mutations_are_unavailable_without_business_calls() -> None:
+def test_free_busy_requires_response_and_mutations_remain_disabled() -> None:
     adapter, session = _adapter({})
     tools = KeystoneCalendarTool(adapter)
 
-    with pytest.raises(KeystoneCapabilityUnavailableError, match="endpoint.calendar.free_busy"):
+    with pytest.raises(KeystoneSchemaValidationError, match="synthetic response data is missing"):
         tools.free_busy(
             start=datetime(2026, 9, 22, 9, tzinfo=timezone.utc),
             end=datetime(2026, 9, 22, 10, tzinfo=timezone.utc),

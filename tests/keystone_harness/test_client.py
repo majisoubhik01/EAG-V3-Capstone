@@ -131,6 +131,112 @@ def _hosted_calendar_list_tool() -> dict[str, Any]:
     }
 
 
+def _hosted_free_busy_tool() -> dict[str, Any]:
+    return {
+        "name": "endpoint.calendar.free_busy",
+        "description": "Read calendar free/busy",
+        "annotations": {"readOnlyHint": True, "destructiveHint": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string", "minLength": 1},
+                "end": {"type": "string", "minLength": 1},
+                "emails": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ]
+                },
+                "calendar_ids": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ]
+                },
+            },
+            "required": ["start", "end"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "result": {"type": "object"},
+            },
+            "required": ["status", "result"],
+            "additionalProperties": True,
+        },
+        "_meta": {
+            "agentswitch": {
+                "permission": "CalendarEvent.read",
+                "risk": "READ",
+            }
+        },
+    }
+
+
+def test_hosted_free_busy_read_uses_observed_schema_and_one_shot_authorization() -> None:
+    session = SequencedSession(
+        [
+            response(
+                {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "serverInfo": {"name": "test-server", "version": "1"},
+                },
+                request_id=1,
+            ),
+            FakeResponse({}, status_code=202),
+            response(
+                {"tools": [_hosted_free_busy_tool()], "nextCursor": None},
+                request_id=2,
+            ),
+            response(
+                {
+                    "content": [],
+                    "structuredContent": {
+                        "status": "ok",
+                        "result": {"ok": True},
+                    },
+                },
+                request_id=3,
+            ),
+        ]
+    )
+    client = KeystoneClient(
+        KeystoneConfig.for_hosted_runner(
+            base_url=DEFAULT_BASE_URL,
+            token=SECRET,
+        ),
+        session=session,  # type: ignore[arg-type]
+        enable_hosted_read_transport=True,
+    )
+    client.list_tools()
+    authorization = client.authorize_read_request(
+        "endpoint.calendar.free_busy",
+        {
+            "start": "2026-10-28T00:00:00+00:00",
+            "end": "2026-11-11T00:00:00+00:00",
+            "emails": ["plant@example.test"],
+            "calendar_ids": ["calendar-1"],
+        },
+    )
+
+    result = client.call_authorized_read(authorization)
+
+    assert result == {"status": "ok", "result": {"ok": True}}
+    assert [call["json"]["method"] for call in session.calls] == [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "tools/call",
+    ]
+    assert session.calls[-1]["json"]["params"]["name"] == "endpoint.calendar.free_busy"
+    assert session.calls[-1]["json"]["params"]["arguments"]["start"].startswith("2026-10-28")
+    with pytest.raises(KeystoneOperationNotAllowedError, match="only once"):
+        client.call_authorized_read(authorization)
+
+
 def test_default_keystone_origin_is_accepted() -> None:
     config = KeystoneConfig()
 

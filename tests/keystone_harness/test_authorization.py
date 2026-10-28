@@ -68,6 +68,14 @@ _FILTER_PROPERTIES: dict[str, dict[str, Any]] = {
             "anyOf": [{"type": "boolean"}, {"type": "integer"}],
         },
     },
+    "SchedulingPreferences.list": {
+        "company_id": {"type": "string", "minLength": 1},
+    },
+    "AvailabilityRule.list": {
+        "owner_party_id": {"type": "string", "minLength": 1},
+        "calendar_id": {"type": "string", "minLength": 1},
+        "company_id": {"type": "string", "minLength": 1},
+    },
 }
 
 
@@ -178,6 +186,12 @@ def _arguments(operation: str) -> dict[str, Any]:
             "role": "req",
             "status": "accepted",
             "is_organizer": True,
+        },
+        "SchedulingPreferences.list": {**base, "company_id": "company-1"},
+        "AvailabilityRule.list": {
+            **base,
+            "owner_party_id": "party-1",
+            "calendar_id": "calendar-1",
         },
     }[operation]
 

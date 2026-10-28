@@ -25,6 +25,10 @@ RESOURCE_READ_OPERATIONS = frozenset(
         "EventAttendee.list",
     }
 )
+GOAL_ONE_LIST_READ_OPERATIONS = frozenset(
+    {"SchedulingPreferences.list", "AvailabilityRule.list"}
+)
+GOAL_ONE_ENDPOINT_READ_OPERATIONS = frozenset({"endpoint.calendar.free_busy"})
 DISPOSABLE_CALENDAR_MUTATION_OPERATIONS = frozenset(
     {
         "CalendarEvent.create",
@@ -89,9 +93,13 @@ def validate_resource_read_policy(
 
     if not isinstance(discovery, ToolDiscoveryResult):
         raise TypeError("discovery must be a ToolDiscoveryResult")
-    if not isinstance(operation, str) or operation not in RESOURCE_READ_OPERATIONS:
+    if not isinstance(operation, str) or operation not in (
+        RESOURCE_READ_OPERATIONS
+        | GOAL_ONE_LIST_READ_OPERATIONS
+        | GOAL_ONE_ENDPOINT_READ_OPERATIONS
+    ):
         raise KeystoneOperationNotAllowedError(
-            "Keystone resource operation is not in the exact read candidate set."
+            "Keystone read operation is not in the exact read candidate set."
         )
 
     matches = [tool for tool in discovery.tools if tool.name == operation]
@@ -101,9 +109,69 @@ def validate_resource_read_policy(
         )
     tool = matches[0]
     _validate_safety_metadata(operation, tool)
-    _validate_descriptor_schemas(operation, tool)
+    if operation in RESOURCE_READ_OPERATIONS | GOAL_ONE_LIST_READ_OPERATIONS:
+        _validate_descriptor_schemas(operation, tool)
+    else:
+        _validate_goal_one_endpoint_schema(operation, tool)
     _validate_arguments(tool.input_schema, arguments)
     return tool
+
+
+def _validate_goal_one_endpoint_schema(
+    operation: str,
+    tool: DiscoveredTool,
+) -> None:
+    if operation != "endpoint.calendar.free_busy":
+        raise KeystoneOperationNotAllowedError(
+            "Keystone endpoint read is not in the exact Goal 1 allowlist."
+        )
+    if not isinstance(tool.input_schema, Mapping):
+        raise KeystoneProtocolError(f"{operation} has a malformed inputSchema.")
+    properties = tool.input_schema.get("properties")
+    required = tool.input_schema.get("required")
+    if (
+        tool.input_schema.get("type") != "object"
+        or tool.input_schema.get("additionalProperties") is not False
+        or not isinstance(properties, Mapping)
+        or not isinstance(required, list)
+        or not {"start", "end"}.issubset(required)
+        or any(
+            not isinstance(properties.get(field), Mapping)
+            or properties[field].get("type") != "string"
+            for field in ("start", "end")
+        )
+    ):
+        raise KeystoneProtocolError(
+            f"{operation} inputSchema does not match the supported read contract."
+        )
+    _validate_schema_definition(tool.input_schema)
+
+    output_schema = tool.output_schema
+    output_properties = (
+        output_schema.get("properties")
+        if isinstance(output_schema, Mapping)
+        else None
+    )
+    output_required = (
+        output_schema.get("required")
+        if isinstance(output_schema, Mapping)
+        else None
+    )
+    if (
+        not isinstance(output_schema, Mapping)
+        or output_schema.get("type") != "object"
+        or not isinstance(output_properties, Mapping)
+        or not isinstance(output_required, list)
+        or not {"status", "result"}.issubset(output_required)
+        or not isinstance(output_properties.get("status"), Mapping)
+        or output_properties["status"].get("type") != "string"
+        or not isinstance(output_properties.get("result"), Mapping)
+        or output_properties["result"].get("type") != "object"
+    ):
+        raise KeystoneProtocolError(
+            f"{operation} outputSchema does not match the supported read contract."
+        )
+    _validate_schema_definition(output_schema)
 
 
 def validate_disposable_calendar_mutation_policy(
@@ -242,7 +310,10 @@ def _validate_safety_metadata(operation: str, tool: DiscoveredTool) -> None:
         raise KeystoneOperationNotAllowedError(
             f"{operation} has no valid AgentSwitch permission metadata."
         )
-    if agentswitch.get("permission") != "read":
+    allowed_permissions = {"read"}
+    if operation == "endpoint.calendar.free_busy":
+        allowed_permissions.add("CalendarEvent.read")
+    if agentswitch.get("permission") not in allowed_permissions:
         raise KeystoneOperationNotAllowedError(
             f"{operation} does not declare read permission."
         )

@@ -1321,6 +1321,9 @@ def test_specialized_transport_and_pilot_reject_other_operations(
         authorization = client.authorize_read_request(operation, arguments)
         with pytest.raises(KeystoneOperationNotAllowedError):
             client._call_calendar_list_pilot(authorization)
+    elif operation == "endpoint.calendar.free_busy":
+        with pytest.raises(KeystoneProtocolError, match="inputSchema"):
+            client.authorize_read_request(operation, arguments)
     else:
         with pytest.raises(KeystoneOperationNotAllowedError):
             client.authorize_read_request(operation, arguments)

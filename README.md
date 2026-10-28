@@ -139,14 +139,18 @@ enabled by the standard `agentswitch-harness.toml` command.
 For Keystone, the hosted-only client requires an observed, schema-validated
 `tools/list` descriptor for each read tool before making one-shot `tools/call` requests for
 `Party.list`, `Calendar.list`, `CalendarEvent.list`, or `EventAttendee.list`.
-Only `structuredContent` matching the discovered output schema is used;
-text-only results fail closed. Goal 1 remains non-passing because Keystone
-does not expose the required preference, availability-rule, or free/busy
-capabilities, so its Goal 1 check remains non-passing. Goal 2 requires exactly
-one audit search result and its owning calendar before producing a 30-minute
-plan for confirmation. These are harness-owned checks, not official evaluator
-results. `results.json` reports the checks and the runner summary explicitly
-says `official_evaluator=not_invoked`.
+Goal 1 additionally uses the exact observed read-only descriptors for
+`SchedulingPreferences.list`, `AvailabilityRule.list`, and
+`endpoint.calendar.free_busy`. These operations have a separate narrow
+allowlist, and only `structuredContent` matching each discovered output schema
+is used; text-only results fail closed. A local tools/list capture found all
+three descriptors, but its catalog completeness was unknown and it did not
+read business data. A later harness check must independently establish unique
+identity, preferences, a relevant availability rule, and visible free/busy
+before Goal 1 can pass. Goal 2 requires exactly one audit search result and its
+owning calendar before producing a 30-minute plan for confirmation. These are
+harness-owned checks, not official evaluator results. `results.json` reports
+the checks and the runner summary explicitly says `official_evaluator=not_invoked`.
 The hosted command exits successfully after writing a valid result document,
 even when individual checks fail; task outcomes are reported in each result
 record. A nonzero exit is reserved for runner or result-generation errors.
@@ -156,7 +160,11 @@ then-strict timestamp parser because event timestamps lacked offsets and most
 records had no event timezone. The explicit fallback can now support a
 read-only proposal, but that snapshot was not re-read and pagination snapshot
 consistency remains unverified. The Goal 1 snapshot also lacked matching
-availability rules and shared free/busy access. These are not goal passes.
+availability rules. A fresh read-only check on 2026-10-28 found one owned
+calendar and one 30-minute preference record, but no rule linked by party or
+calendar; the named company-level “Plant visiting hours” rule is not linked
+to either. The free/busy response returned `freebusy.notShared` with access
+`none`, so availability remains unverified and is not a goal pass.
 The hosted runner does not mutate events, and the local
 `python -m harnesses.suryodaya_harness` demo remains fixture-based and does not
 contact a live instance.

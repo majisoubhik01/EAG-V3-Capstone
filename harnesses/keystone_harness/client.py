@@ -754,14 +754,21 @@ class KeystoneClient:
                 "Keystone read transport is disabled."
             )
 
-        from .authorization import RESOURCE_READ_OPERATIONS
+        from .authorization import (
+            GOAL_ONE_ENDPOINT_READ_OPERATIONS,
+            GOAL_ONE_LIST_READ_OPERATIONS,
+            RESOURCE_READ_OPERATIONS,
+        )
         from .mcp_response import parse_mcp_tool_call_response
 
         with self._state_lock:
             descriptor = self.validate_read_authorization(authorization)
-            if authorization.operation not in RESOURCE_READ_OPERATIONS:
+            if authorization.operation not in (
+                RESOURCE_READ_OPERATIONS | GOAL_ONE_ENDPOINT_READ_OPERATIONS
+                | GOAL_ONE_LIST_READ_OPERATIONS
+            ):
                 raise KeystoneOperationNotAllowedError(
-                    "Keystone hosted read is not in the exact resource allowlist."
+                    "Keystone hosted read is not in the exact approved read allowlist."
                 )
             if authorization in self._consumed_hosted_read_authorizations:
                 raise KeystoneOperationNotAllowedError(

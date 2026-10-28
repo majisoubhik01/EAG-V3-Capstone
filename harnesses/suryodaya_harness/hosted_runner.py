@@ -288,10 +288,10 @@ def _goal_one_reason_code(result: AgentResult) -> str:
         for marker in ("scheduling preference", "availability rule", "minimum notice")
     ):
         return "scheduling_constraints_unavailable"
-    if any(marker in diagnostic for marker in ("plant head", "party", "identity")):
-        return "participant_identity_ambiguous"
     if "calendar" in diagnostic:
         return "calendar_scope_ambiguous"
+    if any(marker in diagnostic for marker in ("plant head", "party", "identity")):
+        return "participant_identity_ambiguous"
     return "planner_needs_clarification"
 
 
@@ -620,8 +620,8 @@ def check_keystone_goal_one(
             f"reason_code={_goal_one_reason_code(result) if result.status is not ResultStatus.PLANNED else 'candidate_reverification_failed'}; "
             f"verification_details={'; '.join(verification.details) or 'no valid candidate'}; "
             f"{_read_trace_summary([*result.tool_calls, *verification_tools.trace])}; "
-            "the Keystone allowlist does not provide scheduling preferences, "
-            "availability rules, or free/busy."
+            "candidate availability requires complete verified identity, preference, "
+            "availability-rule, and visible free/busy evidence."
         )
     return _task(
         task_id="keystone.goal1_read_only_candidate",

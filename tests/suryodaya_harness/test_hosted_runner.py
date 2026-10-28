@@ -9,7 +9,7 @@ import pytest
 
 import harnesses.suryodaya_harness.hosted_runner as hosted_runner
 from calendar_agent import AgentSwitchError
-from calendar_agent.models import ToolCallRecord
+from calendar_agent.models import AgentResult, ResultStatus, ToolCallRecord
 from harnesses.suryodaya_harness.hosted_runner import (
     HostedConfigurationError,
     HostedCheck,
@@ -466,6 +466,22 @@ def test_tool_trace_summary_does_not_include_party_data() -> None:
     trace = [ToolCallRecord("Party.list", {"job_title": "Plant Manager"})]
 
     assert _read_trace_summary(trace) == "read_calls=1;failed_reads=0;mutation_attempts=0"
+
+
+def test_goal_one_reason_code_distinguishes_calendar_scope_from_party_identity() -> None:
+    missing_calendar = AgentResult(
+        goal="calendar.find_30_minutes",
+        status=ResultStatus.NEEDS_CLARIFICATION,
+        summary="No deterministically owned calendar was found for the plant head.",
+    )
+    ambiguous_party = AgentResult(
+        goal="calendar.find_30_minutes",
+        status=ResultStatus.NEEDS_CLARIFICATION,
+        summary="The plant head cannot be deterministically identified from Party data.",
+    )
+
+    assert hosted_runner._goal_one_reason_code(missing_calendar) == "calendar_scope_ambiguous"
+    assert hosted_runner._goal_one_reason_code(ambiguous_party) == "participant_identity_ambiguous"
 
 
 def test_run_hosted_dispatches_suryodaya_check_and_writes_contract_results(

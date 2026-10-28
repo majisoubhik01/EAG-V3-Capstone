@@ -73,12 +73,6 @@ _T = TypeVar("_T")
 class KeystoneCalendarTool:
     """CalendarTool facade with disabled-by-default disposable mutations."""
 
-    _MISSING_FIND_CAPABILITIES = (
-        "SchedulingPreferences.list",
-        "AvailabilityRule.list",
-        "endpoint.calendar.free_busy",
-    )
-
     def __init__(
         self,
         adapter: KeystoneCalendarAdapter,
@@ -175,12 +169,14 @@ class KeystoneCalendarTool:
                 "role": value.role,
                 "status": value.response_status,
             }
+        elif isinstance(value, dict):
+            mapped = dict(value)
         else:
             mapped = asdict(value)
-            if mapped.get("id") != record.source_id:
-                raise KeystoneRecordMappingError(
-                    f"{tool_name} record identity changed during mapping."
-                )
+        if mapped.get("id") != record.source_id:
+            raise KeystoneRecordMappingError(
+                f"{tool_name} record identity changed during mapping."
+            )
 
         timezone_name = mapped.get("timezone")
         if timezone_name is not None:
@@ -386,22 +382,75 @@ class KeystoneCalendarTool:
     def get_event(self, event_id: str) -> dict[str, Any]:
         self._unavailable("CalendarEvent.get", {"id": event_id})
 
-    def list_scheduling_preferences(self, **filters: Any) -> list[dict[str, Any]]:
-        missing = ", ".join(self._MISSING_FIND_CAPABILITIES)
-        self._unavailable(
+    def list_scheduling_preferences(
+        self,
+        *,
+        limit: int = 1000,
+        **filters: Any,
+    ) -> list[dict[str, Any]]:
+        return self._list(
             "SchedulingPreferences.list",
-            {"filters": filters},
-            detail=(
-                "calendar.find_30_minutes also requires the unavailable capabilities: "
-                + missing
-            ),
+            filters or None,
+            limit,
+            self._adapter.list_scheduling_preferences,
+            dict,
         )
 
-    def list_availability_rules(self, **filters: Any) -> NoReturn:
-        self._unavailable("AvailabilityRule.list", {"filters": filters})
+    def list_availability_rules(
+        self,
+        *,
+        limit: int = 1000,
+        **filters: Any,
+    ) -> list[dict[str, Any]]:
+        return self._list(
+            "AvailabilityRule.list",
+            filters or None,
+            limit,
+            self._adapter.list_availability_rules,
+            dict,
+        )
 
-    def free_busy(self, **arguments: Any) -> NoReturn:
-        self._unavailable("endpoint.calendar.free_busy", arguments)
+    def free_busy(self, **arguments: Any) -> dict[str, Any]:
+        normalized = dict(arguments)
+        for field in ("start", "end"):
+            value = normalized.get(field)
+            if hasattr(value, "isoformat"):
+                normalized[field] = value.isoformat()
+        try:
+            request, response = self._adapter.read_goal_one_endpoint(
+                "endpoint.calendar.free_busy", normalized
+            )
+        except KeystoneOperationNotAllowedError as exc:
+            failure = KeystoneAuthorizationFailureError(str(exc))
+            self._record_requests(
+                (),
+                failure,
+                tool_name="endpoint.calendar.free_busy",
+                arguments=normalized,
+            )
+            raise failure from None
+        except KeystoneProtocolError as exc:
+            failure = KeystoneSchemaValidationError(str(exc))
+            self._record_requests(
+                (),
+                failure,
+                tool_name="endpoint.calendar.free_busy",
+                arguments=normalized,
+            )
+            raise failure from None
+        except KeystoneClientError as exc:
+            failure = KeystoneResourceReadError(
+                f"endpoint.calendar.free_busy read failed ({type(exc).__name__})."
+            )
+            self._record_requests(
+                (),
+                failure,
+                tool_name="endpoint.calendar.free_busy",
+                arguments=normalized,
+            )
+            raise failure from None
+        self._record_requests((request,))
+        return response
 
     def _mutation_disabled(
         self, operation: str, arguments: Mapping[str, Any]

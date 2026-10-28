@@ -24,6 +24,8 @@ from .config import (
     KeystoneConfigurationError,
 )
 from .authorization import (
+    GOAL_ONE_ENDPOINT_READ_OPERATIONS,
+    GOAL_ONE_LIST_READ_OPERATIONS,
     RESOURCE_READ_OPERATIONS,
     validate_resource_read_policy,
     validate_json_schema_instance,
@@ -113,6 +115,8 @@ __all__ = [
     "KeystoneSchemaValidationError",
     "run_keystone_goal",
     "RESOURCE_READ_OPERATIONS",
+    "GOAL_ONE_ENDPOINT_READ_OPERATIONS",
+    "GOAL_ONE_LIST_READ_OPERATIONS",
     "validate_resource_read_policy",
     "validate_json_schema_instance",
     "McpContentKind",
