@@ -350,6 +350,21 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
     earliest = max(start, now + min_notice_delta)
     rules = _matching_rules(tools.list_availability_rules(limit=1000), participant["id"], calendar_ids)
     valid_rules = [r for r in rules if isinstance(r.get("weekly_hours"), list) and isinstance(r.get("timezone"), str)]
+    rule_basis = "linked"
+    fallback_name = task.context.get("fallback_availability_rule_name")
+    if not valid_rules and isinstance(fallback_name, str) and fallback_name.strip():
+        # Opt-in: no rule is linked to the participant, so use the one named company-wide rule.
+        named = [
+            r
+            for r in tools.list_availability_rules(limit=1000)
+            if isinstance(r.get("name"), str)
+            and r["name"].strip().casefold() == fallback_name.strip().casefold()
+            and isinstance(r.get("weekly_hours"), list)
+            and isinstance(r.get("timezone"), str)
+        ]
+        if len(named) == 1:
+            valid_rules = named
+            rule_basis = "named company-wide fallback"
     if not valid_rules:
         return _clarification(task, "No valid availability rule is linked to the resolved plant head.", "An explicitly party- or calendar-linked availability rule is required.")
 
@@ -440,7 +455,7 @@ def plan(task: AgentTask, tools: CalendarTool) -> AgentResult:
                 end_at=slot_end.isoformat(),
                 timezone=timezone_name,
                 availability_confirmed=True,
-                reason="visible free/busy, minimum notice, and linked availability rule all support this 30-minute slot",
+                reason=f"visible free/busy, minimum notice, and {rule_basis} availability rule all support this 30-minute slot",
                 party_id=str(participant["id"]),
                 calendar_id=calendar_id,
             )

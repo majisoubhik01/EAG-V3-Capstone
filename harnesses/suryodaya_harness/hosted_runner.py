@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -53,10 +54,16 @@ KEYSTONE_INSTANCE = "keystone"
 SUPPORTED_INSTANCES = frozenset({SURYODAYA_INSTANCE, KEYSTONE_INSTANCE})
 GOAL_ONE = "calendar.find_30_minutes"
 GOAL_ONE_TITLE = "Find 30 minutes with the plant head"
+# No AvailabilityRule is linked to the plant head on the hosted Suryodaya seat, so the
+# check opts into this one named company-wide rule instead of failing closed.
+SURYODAYA_FALLBACK_RULE_NAME = "Plant visiting hours"
 GOAL_TWO = "calendar.move_after_audit"
 GOAL_TWO_TITLE = "Move events after the confirmed press shop and welding audit"
 GOAL_TWO_AUDIT_NUMBER = "EVT-2026-00007"
 GOAL_TWO_AUDIT_TITLE = "Internal quality audit — press shop and welding"
+# Keystone has no press-shop audit; its audits repeat the same title, so the check
+# uses the earliest event with this title and pins it by ID for the planner.
+KEYSTONE_AUDIT_TITLE = "ISO surveillance audit — day 1"
 GOAL_TWO_DEFAULT_SHIFT = timedelta(minutes=30)
 GOAL_TWO_MAX_SHIFT_SEARCH = timedelta(hours=8)
 _SEARCH_WINDOW = timedelta(days=14)
@@ -246,6 +253,16 @@ def load_hosted_environment(values: Mapping[str, object]) -> HostedEnvironment:
     )
 
 
+def _with_plan(prefix: str, move_summary: str, suffix: str = "") -> str:
+    """Embed the full plan when it fits the evidence limit, else a fingerprint of it."""
+
+    full = f"{prefix}plan={move_summary}{suffix}"
+    if len(full) <= MAX_EVIDENCE_LENGTH:
+        return full
+    digest = hashlib.sha256(move_summary.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}plan_sha={digest}{suffix}"
+
+
 def _read_trace_summary(calls: list[ToolCallRecord]) -> str:
     failed_reads = sum(not call.succeeded for call in calls if not call.mutating)
     mutation_attempts = sum(call.mutating for call in calls)
@@ -319,6 +336,7 @@ def check_suryodaya_goal_one(
             "now": current,
             "start": current,
             "end": search_end,
+            "fallback_availability_rule_name": SURYODAYA_FALLBACK_RULE_NAME,
         },
     )
     read_only_tools = ReadOnlyCalendarTool(tools)
@@ -492,7 +510,7 @@ def check_suryodaya_goal_two(
         f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
         for move in result.rescheduling_plan
     )
-    evidence = (
+    evidence = _with_plan(
         "HARNESS_PREDICATE: "
         f"audit={GOAL_TWO_AUDIT_NUMBER};calendar="
         f"{reference.candidates[0].calendar_id if exact_reference else 'unverified'};"
@@ -501,8 +519,8 @@ def check_suryodaya_goal_two(
         f"confirmation_required={str(confirmation_required).lower()};"
         "confirm_or_change_shift=true;"
         "events_moved=false;"
-        f"mutation_attempts={sum(call.mutating for call in result.tool_calls)};"
-        f"plan={move_summary}"
+        f"mutation_attempts={sum(call.mutating for call in result.tool_calls)};",
+        move_summary,
     )
     passed = (
         verification.passed
@@ -625,7 +643,7 @@ def check_keystone_goal_two(
     discovery_tools = KeystoneCalendarTool(adapter)
     try:
         audit_events = discovery_tools.list_events(
-            filters={"search": GOAL_TWO_AUDIT_TITLE},
+            filters={"search": KEYSTONE_AUDIT_TITLE},
             limit=1000,
         )
     except KeystoneGoalIntegrationError as exc:
@@ -652,8 +670,10 @@ def check_keystone_goal_two(
         for event in audit_events
         if isinstance(event.get("title"), str)
         and event["title"].strip().casefold()
-        == GOAL_TWO_AUDIT_TITLE.casefold()
+        == KEYSTONE_AUDIT_TITLE.casefold()
     ]
+    audit_candidates.sort(key=lambda event: str(event.get("start_at")))
+    audit_candidates = audit_candidates[:1]
     if journal is not None:
         journal.record_observation(
             "keystone.goal2_read_only_plan",
@@ -713,7 +733,8 @@ def check_keystone_goal_two(
             "Move everything after the audit",
             {
                 "calendar_id": calendar_id,
-                "audit_title": GOAL_TWO_AUDIT_TITLE,
+                "audit_event_id": audit_id,
+                "audit_title": KEYSTONE_AUDIT_TITLE,
                 "max_shift_search": GOAL_TWO_MAX_SHIFT_SEARCH,
             },
         ),
@@ -745,7 +766,7 @@ def check_keystone_goal_two(
         reference is not None
         and len(reference.candidates) == 1
         and reference.candidates[0].id == audit_id
-        and reference.candidates[0].title == GOAL_TWO_AUDIT_TITLE
+        and reference.candidates[0].title == KEYSTONE_AUDIT_TITLE
         and reference.candidates[0].calendar_id == calendar_id
         and isinstance(reference.candidates[0].status, str)
         and reference.candidates[0].status.casefold() == "confirmed"
@@ -768,15 +789,16 @@ def check_keystone_goal_two(
         f"{move.event_id}:{move.proposed_start_at}>{move.proposed_end_at}"
         for move in result.rescheduling_plan
     )
-    evidence = (
+    evidence = _with_plan(
         "HARNESS_PREDICATE: "
         f"calendar_resolved={str(exact_calendar).lower()};"
         f"moves={len(result.rescheduling_plan)};"
         f"requested_shift=30m;proposed_shift={proposed_shift_minutes}m;"
         f"confirmation_required={str(confirmation_required).lower()};"
         "events_moved=false;"
-        f"mutation_attempts={sum(call.mutating for call in trace)};"
-        f"plan={move_summary};{trace_summary}"
+        f"mutation_attempts={sum(call.mutating for call in trace)};",
+        move_summary,
+        f";{trace_summary}",
     )
     passed = (
         verification.passed

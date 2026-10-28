@@ -518,6 +518,8 @@ class KeystoneClient:
                 },
                 timeout=config.timeout,
                 allow_redirects=False,
+                # The server answers 202 but never finishes the body, so do not wait for it.
+                stream=True,
             )
         except requests.Timeout as exc:
             raise KeystoneTimeoutError(
@@ -529,6 +531,9 @@ class KeystoneClient:
             ) from exc
 
         status_code = getattr(response, "status_code", None)
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
         if type(status_code) is not int:
             raise KeystoneProtocolError(
                 "Keystone MCP initialized notification returned an invalid HTTP status."
